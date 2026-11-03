@@ -119,7 +119,17 @@ waiting, or `gozer cancel <ticket>` if you have changed plans.
 | Multi-chip / mesh work, large model | `--chips all` |
 | Either would do, take what is free | `--chips 1-4` |
 | A specific chip, for a reproduction | `--exact 2` or `--exact 0000:03:00.0` |
+| A board or chip by its name | `--exact left` or `--exact right.1` (needs a names file, see below) |
 | Must start from clean silicon | add `--fresh` |
+
+### Names
+
+A device index is a position and can change. If the machine has a names file
+(`gozer names` shows it), say `--exact left` for a board or `--exact right.1` for a
+chip. The name means the same board after a reboot or a driver reload. Names work in
+`acquire`, `run` and `adopt`. gozer resolves a name before it leases or queues
+anything, so a wrong name exits 21 and changes nothing. `gozer names` lists every
+board and chip with its name, serial, PCI address and current index.
 
 Prefer the elastic form when your work can scale — it gets you started sooner
 and keeps the queue moving.
