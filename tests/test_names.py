@@ -713,7 +713,7 @@ def test_set_never_writes_through_a_link(box, capsys, tmp_path):
 
 
 def test_unset_removes_the_board_and_its_pins(box, capsys):
-    write_names(box, "# top\n" + EXAMPLE + '\n[[chip]]\nboard = "left"\nposition = 0\n'
+    write_names(box, "# top\n\n" + EXAMPLE + '\n[[chip]]\nboard = "left"\nposition = 0\n'
                                            'asic = "1111111111111111"\n')
     code, _, _ = run(["names", "unset", "left"], capsys)
     assert code == 0
@@ -753,3 +753,59 @@ def test_nothing_here_opens_a_tenstorrent_device_node(box, monkeypatch, capsys):
         main(argv)
     capsys.readouterr()
     assert not [p for p in opened if p.startswith("/dev/tenstorrent")]
+
+
+# ---- review fixes ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("token", ["Left", "LEFT.0", "left_1", "left.", "left.1.2", "zzz"])
+def test_a_near_miss_is_refused_not_queued(box, capsys, token):
+    write_names(box, EXAMPLE)
+    gk_for(box)
+    before = state_snapshot(box)
+    code, out, err = run(["acquire", "--exact", token, "--who", "t"], capsys)
+    assert code == names_exit() and "no board is named" in err
+    assert state_snapshot(box) == before
+
+
+def test_without_a_file_only_name_shaped_tokens_are_refused(box, capsys):
+    code, out, err = run(["acquire", "--exact", "left", "--who", "t"], capsys)
+    assert code == names_exit()
+    code, out, err = run(["acquire", "--exact", "9:9", "--who", "t", "--no-queue"], capsys)
+    assert code == 12            # legacy path, unchanged
+
+
+def test_a_pin_outside_the_board_is_an_error_even_if_its_asic_is_absent(box):
+    write_names(box, EXAMPLE + '[[chip]]\nboard = "left"\nposition = 9\nasic = "zzz"\n')
+    assert gk_for(box).names_error.kind == "position-outside"
+
+
+def test_set_keeps_the_inline_comment_on_the_serial_line(box, capsys):
+    write_names(box, f'[[board]]\nname = "left"\nserial = "{S2}"  # rack A\n')
+    assert run(["names", "set", "left", S1], capsys)[0] == 0
+    text = (box / "names.toml").read_text()
+    assert f'serial = "{S1}"  # rack A' in text
+
+
+def test_unset_takes_the_comment_above_the_table_and_tidies_blank_lines(box, capsys):
+    write_names(box, f'# top\n\n# the right one\n[[board]]\nname = "right"\nserial = "{S1}"\n\n'
+                     f'[[board]]\nname = "left"\nserial = "{S2}"\n')
+    assert run(["names", "unset", "right"], capsys)[0] == 0
+    text = (box / "names.toml").read_text()
+    assert "the right one" not in text and "\n\n\n" not in text and "# top" in text
+    assert [b.name for b in names.parse(text).boards] == ["left"]
+
+
+def test_line_numbers_ignore_unicode_line_separators_and_a_bom_is_accepted():
+    nf = names.parse('\ufeff# a\u2028b\n[[board]]\nname = "x"\nserial = "s"\n')
+    assert nf.boards[0].name == "x"
+    with pytest.raises(NamesError) as e:
+        names.parse('# a\u2028b\nbogus\n', "f")
+    assert "f:2" in e.value.message
+
+
+def test_set_keeps_the_file_mode(box, capsys):
+    write_names(box, f'[[board]]\nname = "left"\nserial = "{S2}"\n')
+    os.chmod(box / "names.toml", 0o600)
+    assert run(["names", "set", "third", "0000:03:00.0"], capsys)[0] == 0
+    assert (os.stat(box / "names.toml").st_mode & 0o777) == 0o600

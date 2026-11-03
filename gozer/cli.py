@@ -772,14 +772,17 @@ def cmd_names_set(args) -> int:
         prev = gk.names.by_name.get(old.name)
         if prev is not None:
             affected.append(prev.board)
-    for b in affected:
-        if _board_is_leased(gk, b):
-            raise names_mod.NamesError(
-                "board-leased",
-                f"board {b.serial} is under a lease; release it before "
-                "changing its name")
-    new = names_mod.set_name(path, args.name, board.serial)
-    names_mod.write_text(path, new)
+    # The lease check and the write happen under the gate mutex, so an acquire
+    # cannot take the board between them.
+    with gk.critical_section():
+        for b in affected:
+            if _board_is_leased(gk, b):
+                raise names_mod.NamesError(
+                    "board-leased",
+                    f"board {b.serial} is under a lease; release it before "
+                    "changing its name")
+        new = names_mod.set_name(path, args.name, board.serial)
+        names_mod.write_text(path, new)
     _emit({"set": True, "name": args.name, "serial": board.serial, "file": path},
          f"named board {board.serial} {args.name!r} in {path}", args.json)
     return EXIT_OK

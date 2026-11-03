@@ -219,7 +219,8 @@ asic = "<asic id>"
 ```
 
 `gozer names` lists the serials and ASIC ids on this machine. `gozer names set left <serial>`
-writes the file for you and keeps your comments. Every machine has its own file, because every
+writes the file for you and keeps your comments. `names unset` removes the comment lines
+directly above the table it removes, since they describe it. Every machine has its own file, because every
 machine has its own serials.
 
 **Where the file is.** `$GOZER_NAMES` if set, else `$XDG_CONFIG_HOME/gozer/names.toml`, else
@@ -238,6 +239,9 @@ symbolic link at the file itself. If the file is a link into a dotfiles reposito
   line. If a file has an error, none of its lines take effect.
   `status` and `topology` still run, print a warning, and show boards without names; `gozer names`
   and any command given a name stop with exit 21.
+* With a names file present, a token that is neither a name nor an identifier on this machine
+  (`Left`, `left_1`) exits 21 instead of waiting in the queue for ever. With no file, only a
+  token shaped like a name is refused; other unknown tokens behave as before.
 * A named board that is not on this machine is reported as missing. The other boards still work.
 
 **Order.** gozer prints boards in this order wherever it says "first" and "last": the boards

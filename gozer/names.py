@@ -218,6 +218,14 @@ def check_name(name: str, path=None, line=None) -> None:
              "a chip is addressed)")
 
 
+def _split_lines(text: str) -> list[str]:
+    """Split on \\n only (and drop a leading BOM), so line numbers match what an
+    editor shows. str.splitlines() also breaks on U+2028, \\x0b and others."""
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    return [ln.rstrip("\r") for ln in text.split("\n")]
+
+
 def parse(text: str, path: str | None = None) -> NamesFile:
     """Parse and check the file. Raises NamesError with the line; never returns
     a partly read file."""
@@ -260,7 +268,7 @@ def parse(text: str, path: str | None = None) -> NamesFile:
                                     cur["asic"].strip(), cur_line))
         cur_kind, cur = None, {}
 
-    for lineno, raw in enumerate(text.splitlines(), 1):
+    for lineno, raw in enumerate(_split_lines(text), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -404,15 +412,15 @@ class NameMap:
             slots: dict[int, Chip] = {}
             by_asic = {c.asic_id.casefold(): c for c in b.chips if c.asic_id}
             for p in pins:
-                chip = by_asic.get(p.asic.casefold())
-                if chip is None:
-                    self.unmatched_pins.append(p)
-                    continue
                 if p.position >= size:
                     raise _file_error(
                         nf.path, p.line, "position-outside",
                         f"position {p.position} is outside board "
                         f"{entry.name!r}, which has positions 0 to {size - 1}")
+                chip = by_asic.get(p.asic.casefold())
+                if chip is None:
+                    self.unmatched_pins.append(p)
+                    continue
                 slots[p.position] = chip
             pinned = {c.bdf for c in slots.values()}
             rest = sorted((c for c in b.chips if c.bdf not in pinned),
@@ -468,14 +476,18 @@ class NameMap:
         """
         literals = literal_tokens(boards, unreadable)
         m = NAME_TOKEN_RE.match(token)
-        if not m:
-            return token
-        name, pos = m.group(1), m.group(2)
+        name, pos = (m.group(1), m.group(2)) if m else (None, None)
         entry = next((e for e in self.file.boards if e.name == name), None)
         if entry is None:
             if token in literals:
                 return token
-            raise unknown_name(token, self.file)
+            # With a names file, anything that is neither a name nor an
+            # identifier on this machine (`Left`, `left_1`, `left.`) is refused:
+            # passed on, it would sit in the queue for good. With no file only a
+            # name-shaped token is refused, so other tokens behave as before.
+            if m or self.file.boards:
+                raise unknown_name(token, self.file)
+            return token
         if token in literals:
             raise NamesError(
                 "ambiguous",
@@ -593,15 +605,16 @@ def set_name(path: str, name: str, serial: str) -> str:
             "duplicate-serial",
             f"that board is already named {holder.name!r}; "
             f"`gozer names unset {holder.name}` first")
-    lines = text.splitlines()
+    lines = _split_lines(text.removesuffix("\n")) if text else []
     if existing is None:
         if lines and lines[-1].strip():
             lines.append("")
         lines += ["[[board]]", f'name = "{name}"', f'serial = "{serial}"']
     else:
         for i in range(existing.line, existing.last_line):
-            if re.match(r"^\s*serial\s*=", lines[i]):
-                lines[i] = f'serial = "{serial}"'
+            m = re.match(r"^(\s*serial\s*=\s*)(\"[^\"]*\"|'[^']*')(.*)$", lines[i])
+            if m:
+                lines[i] = f'{m.group(1)}"{serial}"{m.group(3)}'
                 break
     return "\n".join(lines) + "\n"
 
@@ -616,7 +629,7 @@ def unset_name(path: str, name: str) -> str:
     entry = next((e for e in nf.boards if e.name == name), None)
     if entry is None:
         raise unknown_name(name, nf)
-    lines = text.splitlines()
+    lines = _split_lines(text.removesuffix("\n"))
     drop: set[int] = set(range(entry.line - 1, entry.last_line))
     # Pins for this board go with it: left behind they would name a board that
     # no longer has a table, and the file would stop loading.
@@ -632,9 +645,23 @@ def unset_name(path: str, name: str) -> str:
             if _KEY_RE.match(lines[j].strip()):
                 stop = j
         drop |= set(range(start, stop + 1))
-    kept = [ln for i, ln in enumerate(lines) if i not in drop]
+    # Comment lines directly above a removed table belong to it.
+    for start in sorted(drop):
+        j = start - 1
+        while j >= 0 and lines[j].lstrip().startswith("#") and j not in drop:
+            drop.add(j)
+            j -= 1
+    kept = []
+    for i, ln in enumerate(lines):
+        if i in drop:
+            continue
+        if not ln.strip() and kept and not kept[-1].strip():
+            continue                      # collapse blank lines left behind
+        kept.append(ln)
     while kept and not kept[-1].strip():
         kept.pop()
+    while kept and not kept[0].strip():
+        kept.pop(0)
     return ("\n".join(kept) + "\n") if kept else ""
 
 
@@ -649,4 +676,8 @@ def write_text(path: str, text: str) -> None:
     tmp = f"{path}.tmp.{os.getpid()}"
     with open(tmp, "w") as f:
         f.write(text)
+    try:
+        os.chmod(tmp, os.stat(path).st_mode & 0o7777)   # keep an existing mode
+    except FileNotFoundError:
+        pass
     os.replace(tmp, path)
