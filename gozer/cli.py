@@ -15,6 +15,7 @@ import sys
 import time
 
 from gozer import __version__, history, procfd, report
+from gozer import names as names_mod
 from gozer.gatekeeper import DETACHED_GRACE_SECONDS, Gatekeeper
 from gozer.keymaster import Grant, Keymaster, TicketNotFound, parse_duration
 from gozer.topology import TopologyError, all_chips
@@ -61,6 +62,10 @@ EXIT_RELEASE_RESET_FAILED = 19
 # `gozer reset-all` ran tt-smi and it succeeded, but some chips still read all
 # ones. gozer has nothing further to try; the output says what a human must do.
 EXIT_RESET_ALL_INCOMPLETE = 20
+# A names-file or name problem (see gozer/names.py): the file does not load, or a
+# name is unknown, ambiguous, reserved, or points outside its board. Nothing was
+# changed: names are resolved before any lease or ticket is touched.
+EXIT_NAMES = 21
 # Conventional 128 + SIGINT, for `gozer run` interrupted by a signal.
 EXIT_INTERRUPTED = 130
 
@@ -94,6 +99,39 @@ OTHER_USERS_HINT = ("processes of other users (a container) are not visible "
 DEGRADED_HINT = ("its board partner is unreadable, so a grant would hand you "
                  "the dead chip too; run `gozer reset-all` when the whole box "
                  "is free")
+
+
+def _warn_names(gk) -> None:
+    """Say on stderr that the names file was not applied. Read-only commands
+    carry on and show boards without names, so a typo in the file does not stop
+    `status`."""
+    if gk.names_error is not None:
+        print(f"gozer: names not applied: {gk.names_error.message}",
+              file=sys.stderr)
+
+
+def _name_fields(gk, chip) -> dict:
+    """The JSON keys status and topology add for a chip."""
+    return {"name": gk.names.chip_name(chip),
+            "board_name": gk.names.board_name(chip.serial),
+            "position": gk.names.position_of(chip)}
+
+
+def _names_payload(gk) -> dict:
+    return {"names_error": (gk.names_error.message if gk.names_error else None),
+            "names_missing": [{"name": e.name, "serial": e.serial}
+                              for e in gk.names.missing]}
+
+
+def _display_order(gk, items, chip_of):
+    """Order chips as gozer says first and last. Without a names file that is
+    device-index order, which is what status has always printed; with one it is
+    the names order (file boards, then the rest by serial; positions inside)."""
+    if not gk.names.file.boards or gk.names_error is not None:
+        return sorted(items, key=lambda x: chip_of(x).dev_index)
+    rank = {c.bdf: (bi, ci) for bi, b in enumerate(gk.boards)
+            for ci, c in enumerate(b.chips)}
+    return sorted(items, key=lambda x: rank.get(chip_of(x).bdf, (10**6, 0)))
 
 
 def _refuse_unreadable_exact(gk, exact, as_json) -> int | None:
@@ -134,7 +172,8 @@ def cmd_status(args) -> int:
     # `acquire` (via free_units) and `reconcile` still reap with reap=True;
     # that stays load-bearing there (see free_units' comment) and
     # deliberate here (reconcile is the explicit, intentional reaper).
-    states = gk.reconcile(reap=False)
+    states = _display_order(gk, gk.reconcile(reap=False), lambda s: s.chip)
+    _warn_names(gk)
     payload = {
         "grain": gk.grain,
         "chips": [
@@ -146,25 +185,33 @@ def cmd_status(args) -> int:
              "owner_dead": s.owner_dead,
              "holder_containers": {
                  str(p): cid for p in s.pids
-                 if (cid := procfd.container_id(p, gk.proc_root))}}
+                 if (cid := procfd.container_id(p, gk.proc_root))},
+             **_name_fields(gk, s.chip)}
             for s in states
         ] + [
             {"dev_index": c.dev_index, "bdf": c.bdf, "board": None,
              "card": c.card, "state": "UNREADABLE", "who": None, "pid": None,
              "reason": None, "pids_holding": [], "overstayed": False,
-             "owner_dead": False, "holder_containers": {}}
+             "owner_dead": False, "holder_containers": {},
+             "name": None, "board_name": None, "position": None}
             for c in gk.unreadable
         ],
         "queue": gk.queue_entries(),
+        **_names_payload(gk),
     }
-    payload["chips"].sort(key=lambda c: c["dev_index"])
+    # `states` is already in display order and the unreadable chips follow it.
+    # Without a names file that order is device index, so merge them as before.
+    if not gk.names.file.boards or gk.names_error is not None:
+        payload["chips"].sort(key=lambda c: c["dev_index"])
     lines = [f"grain: {gk.grain}   ({len(gk.boards)} boards, "
              f"{len(states) + len(gk.unreadable)} chips)"]
     current_board = None
     for s in states:
         if s.chip.serial != current_board:
             current_board = s.chip.serial
-            lines.append(f"board {current_board}  ({s.chip.card})")
+            bname = gk.names.board_name(current_board)
+            lines.append(f"board {bname + '  ' if bname else ''}"
+                         f"{current_board}  ({s.chip.card})")
         who = (s.lease or {}).get("who", "")
         pid = (s.lease or {}).get("pid", "")
         extra = f"  {who} pid {pid}" if who else ""
@@ -191,12 +238,18 @@ def cmd_status(args) -> int:
                       f"device still held by {who_holds}")
         if s.overstayed:
             extra += "  OVERSTAYED"
-        lines.append(f"  chip {s.chip.dev_index}  {s.chip.bdf}  {s.state:<15}{extra}")
+        cname = gk.names.chip_name(s.chip)
+        label = f"{cname:<8}" if cname else ""
+        lines.append(f"  chip {s.chip.dev_index}  {s.chip.bdf}  "
+                     f"{label}{s.state:<15}{extra}")
     if gk.unreadable:
         lines.append("unreadable (not grantable):")
         for c in gk.unreadable:
             lines.append(f"  chip {c.dev_index}  {c.bdf}  UNREADABLE")
         lines.append(f"  {UNREADABLE_HINT}")
+    for e in gk.names.missing:
+        lines.append(f"named but not on this machine: {e.name} "
+                     f"(serial {e.serial})")
     q = gk.queue_entries()
     if q:
         lines.append("queue:")
@@ -209,22 +262,34 @@ def cmd_status(args) -> int:
 
 def cmd_topology(args) -> int:
     gk, _ = _make(args)
+    _warn_names(gk)
     payload = {
         "grain": gk.grain,
         "boards": [
             {"serial": b.serial, "card": b.card,
+             "name": gk.names.board_name(b.serial),
              "chips": [{"dev_index": c.dev_index, "bdf": c.bdf,
-                        "asic_id": c.asic_id} for c in b.chips]}
+                        "asic_id": c.asic_id, **_name_fields(gk, c)}
+                       for c in b.chips]}
             for b in gk.boards
         ],
         "unreadable": [{"dev_index": c.dev_index, "bdf": c.bdf}
                        for c in gk.unreadable],
+        **_names_payload(gk),
     }
     lines = [f"grain: {gk.grain}"]
     for b in gk.boards:
-        lines.append(f"board {b.serial}  ({b.card})")
+        bname = gk.names.board_name(b.serial)
+        lines.append(f"board {bname + '  ' if bname else ''}{b.serial}  "
+                     f"({b.card})")
         for c in b.chips:
-            lines.append(f"  chip {c.dev_index}  {c.bdf}  asic {c.asic_id}")
+            cname = gk.names.chip_name(c)
+            label = f"{cname:<8}" if cname else ""
+            lines.append(f"  chip {c.dev_index}  {c.bdf}  {label}"
+                         f"asic {c.asic_id}")
+    for e in gk.names.missing:
+        lines.append(f"named but not on this machine: {e.name} "
+                     f"(serial {e.serial})")
     _emit(payload, "\n".join(lines), args.json)
     return EXIT_OK
 
@@ -249,6 +314,12 @@ def _render_grant(grant: Grant, gk, owner_pid: int | None = None) -> str:
 
 def cmd_acquire(args) -> int:
     gk, km = _make(args)
+    # A name (`left`, `right.1`) becomes the serial or BDF the rest of gozer
+    # uses, here, before anything can be leased or queued. A name that does not
+    # resolve raises NamesError and nothing has been touched. The resolved value
+    # is what a queue ticket stores, so a replay by `wait` does not depend on
+    # the names file.
+    args.exact = gk.resolve_target(args.exact)
     refused = _refuse_unreadable_exact(gk, args.exact, args.json)
     if refused is not None:
         return refused
@@ -503,16 +574,18 @@ def cmd_adopt(args) -> int:
     gk, km = _make(args)
     from gozer import procfd
     from gozer.gatekeeper import utcnow
+    asked = args.target
+    args.target = gk.resolve_target(args.target)
     fd_map = procfd.holders(gk.proc_root)
     target = gk._resolve_exact(args.target)
     if target is None:
-        _emit({"adopted": False}, f"unknown chip or board: {args.target}", args.json)
+        _emit({"adopted": False}, f"unknown chip or board: {asked}", args.json)
         return EXIT_NO_LEASE
 
     chips = gk.chips_in_unit(target)
     pids = sorted({p for c in chips for p in fd_map.get(c.dev_index, [])})
     if not pids:
-        _emit({"adopted": False}, f"{args.target} has no process holding it",
+        _emit({"adopted": False}, f"{asked} has no process holding it",
               args.json)
         return EXIT_UNAVAILABLE
 
@@ -526,7 +599,7 @@ def cmd_adopt(args) -> int:
         "reset_on_release": True, "state": "adopted",
     }
     if not gk.claim_unit(target, lease):
-        _emit({"adopted": False}, f"{target} is already leased", args.json)
+        _emit({"adopted": False}, f"{asked} is already leased", args.json)
         return EXIT_UNAVAILABLE
     gk.write_lease(lease)
     history.log(gk.history_root, "adopted", lease_id=lease_id, who=args.who,
@@ -598,6 +671,130 @@ def cmd_report(args) -> int:
     print(f"gozer report: wrote {out_path}")
     return EXIT_OK
 
+# ---- names ----------------------------------------------------------------
+
+def _names_path(gk) -> str:
+    return gk.names_path or names_mod.default_path()
+
+
+def _require_names(gk) -> None:
+    """Raise the names-file error, for the commands that are about the file."""
+    if gk.names_error is not None:
+        raise gk.names_error
+
+
+def cmd_names(args) -> int:
+    gk, _ = _make(args)
+    _require_names(gk)
+    nm = gk.names
+    path = _names_path(gk)
+    boards = []
+    for b in gk.boards:
+        name = nm.board_name(b.serial)
+        boards.append({
+            "name": name, "serial": b.serial, "card": b.card,
+            "chips": [{"name": nm.chip_name(c), "position": nm.position_of(c),
+                       "dev_index": c.dev_index, "bdf": c.bdf,
+                       "asic_id": c.asic_id} for c in b.chips]})
+    payload = {
+        "file": path, "exists": os.path.lexists(path), "boards": boards,
+        "missing": [{"name": e.name, "serial": e.serial} for e in nm.missing],
+        "unmatched_pins": [{"board": p.board, "position": p.position,
+                            "asic": p.asic} for p in nm.unmatched_pins],
+    }
+    lines = [f"names file: {path}"
+             + ("" if payload["exists"] else "  (does not exist)")]
+    for b in boards:
+        head = b["name"] if b["name"] else "(no name)"
+        lines.append(f"board {head}  serial {b['serial']}  ({b['card']})")
+        for c in b["chips"]:
+            label = c["name"] or f"chip {c['dev_index']}"
+            lines.append(f"  {label:<10} index {c['dev_index']}  {c['bdf']}  "
+                         f"asic {c['asic_id']}")
+        if not b["name"]:
+            lines.append(f"  name it with: gozer names set <name> {b['serial']}")
+    for e in nm.missing:
+        lines.append(f"missing: {e.name} (serial {e.serial}) is named in the "
+                     "file but is not on this machine")
+    for p in nm.unmatched_pins:
+        lines.append(f"unmatched pin: {p.board}.{p.position} asic {p.asic} is "
+                     "not a chip of that board")
+    _emit(payload, "\n".join(lines), args.json)
+    return EXIT_OK
+
+
+def cmd_names_udev(args) -> int:
+    gk, _ = _make(args)
+    _require_names(gk)
+    text = names_mod.udev_rules(gk.names)
+    _emit({"rules": text, "install": names_mod.UDEV_RULES_PATH}, text.rstrip("\n"),
+          args.json)
+    return EXIT_OK
+
+
+def _find_board(gk, token: str):
+    """The board a name, serial, BDF, device index or ASIC id belongs to."""
+    for b in gk.boards:
+        if gk.names.board_name(b.serial) == token or token.casefold() == \
+                b.serial.casefold():
+            return b
+        for c in b.chips:
+            if token in (c.bdf, str(c.dev_index)) or (
+                    c.asic_id and token.casefold() == c.asic_id.casefold()):
+                return b
+    raise names_mod.NamesError(
+        "unknown-board",
+        f"{token!r} is not a board name, serial, PCI address or device index "
+        "on this machine (see `gozer names`)")
+
+
+def _board_is_leased(gk, board) -> bool:
+    held = gk.held_units()
+    return any(gk.unit_key_for(c) in held for c in board.chips)
+
+
+def cmd_names_set(args) -> int:
+    gk, _ = _make(args)
+    _require_names(gk)
+    path = _names_path(gk)
+    board = _find_board(gk, args.board)
+    names_mod.check_name(args.name)
+    if args.name in names_mod.literal_tokens(gk.boards, gk.unreadable):
+        raise names_mod.NamesError(
+            "ambiguous",
+            f"{args.name!r} is the serial or ASIC id of a chip on this "
+            "machine, so it could not be told from the name; pick another")
+    # A board under a lease keeps the name its holder was told. Re-pointing an
+    # existing name takes it off the board that has it now, so that board counts.
+    affected = [board]
+    old = next((e for e in gk.names.file.boards if e.name == args.name), None)
+    if old is not None:
+        prev = gk.names.by_name.get(old.name)
+        if prev is not None:
+            affected.append(prev.board)
+    for b in affected:
+        if _board_is_leased(gk, b):
+            raise names_mod.NamesError(
+                "board-leased",
+                f"board {b.serial} is under a lease; release it before "
+                "changing its name")
+    new = names_mod.set_name(path, args.name, board.serial)
+    names_mod.write_text(path, new)
+    _emit({"set": True, "name": args.name, "serial": board.serial, "file": path},
+         f"named board {board.serial} {args.name!r} in {path}", args.json)
+    return EXIT_OK
+
+
+def cmd_names_unset(args) -> int:
+    gk, _ = _make(args)
+    _require_names(gk)
+    path = _names_path(gk)
+    new = names_mod.unset_name(path, args.name)
+    names_mod.write_text(path, new)
+    _emit({"unset": True, "name": args.name, "file": path},
+         f"removed the name {args.name!r} from {path}", args.json)
+    return EXIT_OK
+
 
 def _repo_root() -> str | None:
     """The git work tree containing the current directory, or None."""
@@ -612,6 +809,7 @@ def _repo_root() -> str | None:
 
 def cmd_run(args) -> int:
     gk, km = _make(args)
+    args.exact = gk.resolve_target(args.exact)
     refused = _refuse_unreadable_exact(gk, args.exact, False)
     if refused is not None:
         return refused
@@ -655,12 +853,30 @@ def build_parser() -> argparse.ArgumentParser:
     # placebo, so it is not offered.
     add("topology", cmd_topology, "chips, boards, and the lease grain")
 
+    nm = add("names", cmd_names,
+             "give boards names that survive reboots; list them")
+    nsub = nm.add_subparsers(dest="names_cmd")
+    nu = nsub.add_parser("udev", help="print udev rules for "
+                                      "/dev/tenstorrent/by-name (writes nothing)")
+    nu.add_argument("--json", action="store_true")
+    nu.set_defaults(func=cmd_names_udev)
+    ns = nsub.add_parser("set", help="name a board")
+    ns.add_argument("name")
+    ns.add_argument("board", help="a serial, PCI address, device index, or "
+                                  "an existing name")
+    ns.add_argument("--json", action="store_true")
+    ns.set_defaults(func=cmd_names_set)
+    nx = nsub.add_parser("unset", help="remove a board's name")
+    nx.add_argument("name")
+    nx.add_argument("--json", action="store_true")
+    nx.set_defaults(func=cmd_names_unset)
+
     for name, aliases in (("acquire", ("summon",)),):
         a = add(name, cmd_acquire, "take a lease on chips", aliases=aliases)
         a.add_argument("--chips", default="1", help="N, all, or LO-HI")
         a.add_argument("--who", required=True, help="e.g. claude:ttm-optimize")
         a.add_argument("--reason", default=None)
-        a.add_argument("--exact", default=None, help="a BDF, device index, or unit")
+        a.add_argument("--exact", default=None, help="a name (left, right.1), BDF, device index, or unit")
         a.add_argument("--fresh", action="store_true", help="require reset chips")
         a.add_argument("--expect", default=None, help="advisory duration, e.g. 45m")
         a.add_argument("--ticket", default=None, help="claim against a queue ticket")
@@ -712,7 +928,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="use sudo for cross-user fd visibility")
 
     ad = add("adopt", cmd_adopt, "wrap a lease around untracked running work")
-    ad.add_argument("target", help="a BDF, device index, or unit key")
+    ad.add_argument("target", help="a name (left, right.1), BDF, device index, "
+                                   "or unit key")
     ad.add_argument("--who", required=True)
     ad.add_argument("--reason", default=None)
 
@@ -733,7 +950,8 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("--chips", default="1")
     rn.add_argument("--who", default="shell:gozer-run")
     rn.add_argument("--reason", default=None)
-    rn.add_argument("--exact", default=None)
+    rn.add_argument("--exact", default=None,
+                    help="a name (left, right.1), BDF, device index, or unit")
     rn.add_argument("--fresh", action="store_true")
     rn.add_argument("--expect", default=None)
     rn.add_argument("command", nargs=argparse.REMAINDER)
@@ -752,6 +970,9 @@ def main(argv: list[str] | None = None) -> int:
     except TopologyError as e:
         print(f"gozer: {e}", file=sys.stderr)
         return EXIT_NO_TOPOLOGY
+    except names_mod.NamesError as e:
+        print(f"gozer: {e.message}", file=sys.stderr)
+        return EXIT_NAMES
     except TimeoutError as e:
         # critical_section composes a message that names the mutex path, its
         # owning uid when that is the problem, and how to clear it by hand --

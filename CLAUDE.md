@@ -644,3 +644,39 @@ and cannot see host processes).
   chips as FREE (README now says to run gozer on the host).
 * Dropping the deb into `tt-developer-image/docker/debs/` would make `Dockerfile.qb2` step 7 install
   every deb there and skip the apt install of tt-toplike; not done.
+
+## Stable names for boards and chips (2026-11-03, 0.5.0)
+
+Prompt (relayed from the operator by the tt-orchard-cf session): implement
+tsingletaryTT/tt-gozer issue 4 to completion and merge it. The issue: device indices follow
+PCI order, gozer lists boards by serial, and on a two-board Blackhole box the two orders are
+opposite, so "board 0" depends on which tool answers (tt-orchard issue 26 exposed it).
+
+* `gozer/names.py`: a names file (`$GOZER_NAMES`, else `$XDG_CONFIG_HOME/gozer/names.toml`),
+  a strict parser for the small TOML subset it needs, `NameMap` (order, positions, ASIC pins,
+  resolution), udev rule text, and the text edits behind `names set` and `names unset`.
+  The parser is hand-written because `tomllib` needs Python 3.11 and gozer supports 3.10, and
+  because it can name the line of every error.
+* `Gatekeeper.boards` is now the names order; `Gatekeeper.names`, `names_error` and
+  `resolve_target`. Names are resolved in `cmd_acquire`, `cmd_run` and `cmd_adopt` before
+  anything is leased or queued, so tickets and leases keep storing BDFs and serials.
+* New exit status 21 for names problems. `status` and `topology` print a warning for a bad file
+  and show boards without names; commands given a name stop.
+* `tests/conftest.py` points `GOZER_NAMES` at a missing file for every test, so a test does not
+  depend on whether the person running it has named their boards.
+
+Design questions the issue did not answer, and what was picked:
+* **Allocation preference is unchanged.** `acquire --chips N` still prefers clean units, then the
+  lowest device index. Names change printing, `all` ordering and addressing.
+* **`status` without a names file still lists chips by device index**, as before. With a file it
+  uses the names order.
+* **"The same bounded, no-follow reading gozer uses for its other files"** did not exist; the
+  names reader is the first one (64 KiB cap, `O_NOFOLLOW`, regular files only).
+* **A name equal to a serial or ASIC id on this machine is "ambiguous" when used**, and the
+  static "looks like a serial" rule (eight or more hex digits) is "reserved" at load.
+* **At board grain, `right.1` leases the whole board** (UMD shows both chips), as a BDF does.
+* **A bad file does not stop read-only commands.** It stops `names` and any command given a name.
+* `names set` writes by appending a table or changing a serial line, so comments survive.
+
+Not done: ordering of the chips inside a board for boards that have no name (still device index),
+a board-level reset, and installing the udev rules (printed, not installed).

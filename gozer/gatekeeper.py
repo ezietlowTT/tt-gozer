@@ -38,6 +38,8 @@ import time
 from dataclasses import dataclass
 
 from gozer import history, procfd
+from gozer import names as names_mod
+from gozer.names import NameMap
 # _elapsed_seconds lives in jsonstore (the shared, dependency-free home) so
 # gozer/queue.py can use the same implementation without importing this
 # module, which would be an import cycle. Imported into this namespace
@@ -138,7 +140,8 @@ def _user_state_dir() -> str:
 
 class Gatekeeper:
     def __init__(self, root: str | None = None, sysfs_root: str | None = None,
-                 proc_root: str = "/proc", history_root: str | None = None):
+                 proc_root: str = "/proc", history_root: str | None = None,
+                 names_path: str | None = None):
         explicit_root = root or os.environ.get("GOZER_ROOT")
         self.root = explicit_root or DEFAULT_ROOT
         # history.jsonl's home is decoupled from the rest of the gate state:
@@ -162,6 +165,13 @@ class Gatekeeper:
         self.history_root = history or self.root
         self.sysfs_root = sysfs_root
         self.proc_root = proc_root
+        # The names file (see gozer/names.py). None means the default path.
+        self.names_path = names_path
+        self._names = None
+        self._names_error = None
+        # The topology the cached names map was built from. Keymaster drops
+        # `_topo` to re-read sysfs after a reset; the map is then stale too.
+        self._names_topo = None
         # Set by cmd_reconcile when --sudo is passed; see procfd.holders().
         self.use_sudo = False
         # Reentrancy depth for critical_section(): >0 means this process
@@ -461,8 +471,56 @@ class Gatekeeper:
         return self._topo
 
     @property
+    def names(self) -> NameMap:
+        """The names file applied to this machine's boards.
+
+        A file that does not load is never partly applied: this is then an
+        empty map (no names, boards in serial order) and `names_error` holds
+        why. Read-only commands carry on and say so; a command given a name
+        refuses with the error.
+        """
+        topo = self._topology()
+        if self._names is None or self._names_topo is not topo:
+            raw = topo.boards
+            self._names_topo = topo
+            self._names_error = None
+            try:
+                self._names = names_mod.build(names_mod.load(self.names_path),
+                                              raw)
+            except names_mod.NamesError as e:
+                self._names_error = e
+                self._names = NameMap(None, raw)
+        return self._names
+
+    @property
+    def names_error(self):
+        """The NamesError that stopped the names file loading, or None."""
+        self.names
+        return self._names_error
+
+    def resolve_target(self, token: str | None) -> str | None:
+        """Turn a name (`left`, `left.1`) into the BDF or serial the rest of
+        gozer uses; anything else comes back unchanged. Raises NamesError.
+
+        Done once, at the command line, so leases and tickets keep storing BDFs
+        and serials.
+        """
+        if token is None:
+            return None
+        if (self.names_error is not None
+                and names_mod.NAME_TOKEN_RE.match(token)):
+            if token not in names_mod.literal_tokens(self.boards,
+                                                     self.unreadable):
+                raise self._names_error
+        return self.names.resolve(token, self.boards, self.unreadable,
+                                  self.grain)
+
+    @property
     def boards(self) -> list[Board]:
-        return self._topology().boards
+        """Boards in the order gozer says "first" and "last" in: boards the
+        names file lists, in file order, then the rest by serial. With no file
+        that is serial order, as before."""
+        return self.names.ordered()
 
     @property
     def unreadable(self) -> list[Chip]:

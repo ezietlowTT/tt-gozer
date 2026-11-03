@@ -1,4 +1,4 @@
-.TH GOZER 1 "October 2026" "tt\-gozer 0.4.0" "User Commands"
+.TH GOZER 1 "October 2026" "tt\-gozer 0.5.0" "User Commands"
 .SH NAME
 gozer \- cooperative Tenstorrent chip leasing
 .SH SYNOPSIS
@@ -60,6 +60,18 @@ Show who held what, when, and for how long. The last 20 events by default.
 .TP
 .B report [--out PATH] [--json]
 Regenerate the containment\-log page from history.jsonl. Inside a git checkout the default output is docs/log.html at the repository root; anywhere else --out PATH is required. Missing parent directories are created. Never touches hardware.
+.TP
+.B names [--json]
+List boards and chips with their names, serials, ASIC ids, PCI addresses and device indices. Flags boards with no name and named boards that are missing. The names file is $GOZER_NAMES, else $XDG_CONFIG_HOME/gozer/names.toml, else ~/.config/gozer/names.toml.
+.TP
+.B names set NAME BOARD
+Name a board (BOARD is a serial, PCI address, device index or an existing name). Refuses a board under a lease.
+.TP
+.B names unset NAME
+Remove a name and any chip pins for that board.
+.TP
+.B names udev
+Print udev rules that create /dev/tenstorrent/by\-name/BOARD\-POSITION. Writes nothing; the install commands are in the output.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -98,6 +110,9 @@ release tore the lease down but its reset failed; the units are not marked clean
 .B 20
 reset\-all ran tt\-smi and it succeeded, but some chips still read all ones; gozer has nothing further to try, so a human must power\-cycle the box or reseat the card
 .TP
+.B 21
+a names\-file or name problem: the file does not load (the message gives the line), or a name is unknown, ambiguous, reserved, or outside its board. Nothing was changed
+.TP
 .B 130
 gozer run was interrupted by a signal (128 + SIGINT); the lease was still released
 .SH FILES
@@ -107,6 +122,9 @@ Lease state: gate, leases, queue and mutex directories. Default /tmp/tt\-gozer. 
 .TP
 .I $GOZER_HISTORY_ROOT/history.jsonl
 Append\-only log of every grant, release, reap and refusal. Default ~/.local/state/tt\-gozer (or $XDG_STATE_HOME/tt\-gozer).
+.TP
+.I $GOZER_NAMES
+Board and chip names. Default $XDG_CONFIG_HOME/gozer/names.toml, else ~/.config/gozer/names.toml.
 .TP
 .I /usr/share/tt\-gozer/skills
 The Claude Code skills. gozer\-install\-skills links them into ~/.claude/skills.

@@ -157,7 +157,10 @@ $ gozer history -n 5
 | Command | Does |
 |---|---|
 | `status` [`--json`] | who holds what, and who is waiting -- read-only, never mutates state |
-| `topology` [`--json`] | chips, boards, and the lease grain |
+| `topology` [`--json`] | chips, boards, and the lease grain; shows the name of each board and chip when a names file exists |
+| `names` [`--json`] | list boards and chips with their names, serials, ASIC ids, PCI addresses and current device indices, and flag boards that have no name and named boards that are missing |
+| `names set <name> <board>` / `names unset <name>` | name a board (by serial, PCI address, device index or an existing name), or remove a name. `set` refuses a board that is under a lease |
+| `names udev` | print udev rules for `/dev/tenstorrent/by-name/`; writes nothing |
 | `acquire` / `summon` `--chips N\|all\|LO-HI --who W` [`--owner-pid N`] | take a lease on chips |
 | `wait <ticket>` [`--timeout 8m`] | block until a queued ticket is granted |
 | `queue` [`--json`] | list waiting requests |
@@ -182,6 +185,97 @@ git checkout it writes `docs/log.html`; that file is generated, is listed in `.g
 committed. `--out` writes it somewhere else. `docs/index.html` is a different
 page: the explainer, built by `scripts/build_site.py`, and `gozer report` never writes it. `--json` prints the
 same computed stats without rendering HTML, for scripting.
+
+## Names for boards and chips
+
+`/dev/tenstorrent/N`, the `tt-smi` index and the ttnn device id are positions. The driver
+hands them out in probe order, so they change when a chip fails to enumerate, when the driver
+reloads, or when the PCI layout changes. gozer lists boards by serial, and on a two-board
+Blackhole box the serial order and the device-index order can be opposite. "Board 0" then
+means a different board depending on which tool answers.
+
+A names file gives each board a short name once. gozer then accepts that name, and `name.N`
+for a chip, anywhere it takes a board or chip: `acquire --exact`, `run --exact` and `adopt`.
+The name is turned into the BDF or serial gozer already uses before anything is leased or
+queued, so lease records and queue tickets keep storing BDFs and serials.
+
+```toml
+# ~/.config/gozer/names.toml
+# The order of the [[board]] tables is the board order.
+[[board]]
+name = "left"
+serial = "<board serial>"
+
+[[board]]
+name = "right"
+serial = "<board serial>"
+
+# Optional: pin a chip to a position inside its board by ASIC id, so a card
+# moved to another slot keeps its name.
+[[chip]]
+board = "right"
+position = 0
+asic = "<asic id>"
+```
+
+`gozer names` lists the serials and ASIC ids on this machine. `gozer names set left <serial>`
+writes the file for you and keeps your comments. Every machine has its own file, because every
+machine has its own serials.
+
+**Where the file is.** `$GOZER_NAMES` if set, else `$XDG_CONFIG_HOME/gozer/names.toml`, else
+`~/.config/gozer/names.toml`. gozer reads it with a size limit (64 KiB) and does not follow a
+symbolic link at the file itself. If the file is a link into a dotfiles repository, set
+`GOZER_NAMES` to the file it leads to.
+
+**Rules.**
+
+* A name is a lowercase letter, then up to 31 lowercase letters, digits or hyphens. Names are
+  case-sensitive. A name may not be `all`, a whole number, a PCI address, or a run of eight or
+  more hex digits (which could be taken for a serial or ASIC id). A name that is also the serial
+  or ASIC id of a chip on the machine is refused as ambiguous when it is used.
+* A duplicate name, a serial listed twice, an unknown key or table, a `[[chip]]` for a board
+  that has no table, and a position outside the board are errors. The message gives the file and
+  line. If a file has an error, none of its lines take effect.
+  `status` and `topology` still run, print a warning, and show boards without names; `gozer names`
+  and any command given a name stop with exit 21.
+* A named board that is not on this machine is reported as missing. The other boards still work.
+
+**Order.** gozer prints boards in this order wherever it says "first" and "last": the boards
+the file lists, in file order, then the boards without a name, sorted by serial. Chips inside a
+board are in position order. Position is the PCI address order (the lowest address is `.0`),
+unless a `[[chip]]` pins a chip to a position. `status` and `topology` (and their `--json`)
+print in this order and add `name`, `board_name` and `position` keys; the existing keys mean what
+they meant. With no names file `status` lists chips by device index as it always did.
+Which chips an `acquire --chips N` picks is unchanged: it still prefers clean units, then the
+lowest device index.
+
+**What a name leases.** `--exact left` leases that board. `--exact right.1` leases that chip.
+On a board of two chips the lease unit is the board, as it is for a BDF (UMD shows both chips of
+a board), so `right.1` leases the board that holds the chip and says the grant was expanded. At
+chip grain `left.2` leases one chip, and a board name works only for a board of one chip.
+`TT_VISIBLE_DEVICES` is unchanged: gozer exports BDFs.
+
+**Device nodes.** `gozer names udev` prints udev rules that create
+`/dev/tenstorrent/by-name/<board>-<position>` (for example `left-0`) by matching `tt_asic_id`,
+the way the `by-id` rule does. It writes nothing. Installing the rules needs root, so you do it:
+
+```bash
+gozer names udev | sudo tee /etc/udev/rules.d/60-tenstorrent-by-name.rules >/dev/null
+sudo udevadm control --reload
+sudo udevadm trigger --subsystem-match=tenstorrent --action=change
+```
+
+With those links a container, a script or a note can say `left-0` without gozer.
+
+**Limits.**
+
+* ttnn, tt-metal and `tt-smi` indices and mesh device ids are positions in whatever set of chips
+  is visible. They carry no identity. Names choose which chips are visible; the mesh order inside
+  a job still follows the fabric topology.
+* gozer cannot tell which physical board a serial is. You say so once, with `gozer names set`.
+* The kernel driver and UMD know nothing of these names. If this works well, `by-name` can be
+  proposed there.
+* Nothing in this feature opens `/dev/tenstorrent/*`. Identity comes from sysfs only.
 
 ## For agents
 
@@ -217,6 +311,7 @@ carry the outcome, so no output parsing is required:
 | `18` | `reset` ran, and afterwards the lease was gone or another lease held its chips; the reset may have hit chips that were no longer yours |
 | `19` | `release` tore the lease down but its reset failed; the units are not marked clean (so `--fresh` refuses them) and the chips may be unreadable until reset. The output, and `recovery` in `--json`, give the commands. Before 0.3.5 this exited `0` |
 | `20` | `reset-all` ran tt-smi and it succeeded, but some chips still read all ones; gozer has nothing further to try, so a human must power-cycle the box or reseat the card |
+| `21` | a names-file or name problem: the file does not load (the message gives the line), or a name is unknown, ambiguous, reserved, or outside its board. Nothing was changed |
 | `130` | `gozer run` was interrupted by a signal (128 + SIGINT); the lease was still released |
 
 Waiting is designed around agents: `acquire` never blocks, so an agent gets a ticket and can

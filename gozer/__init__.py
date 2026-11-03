@@ -71,4 +71,8 @@ The keymaster must meet the gatekeeper for the coming of Gozer.
 # now writes docs/log.html by default (it used to overwrite docs/index.html).
 # `main(argv=None)` also works when called with no arguments, which the
 # installed /usr/bin/gozer entry point does.
-__version__ = "0.4.0"
+#
+# 0.5.0 (2026-11-03): stable names for boards and chips (`gozer names`, a names
+# file, `name` and `name.N` accepted wherever a board or chip is, and udev
+# rules for /dev/tenstorrent/by-name). New exit status 21 for names problems.
+__version__ = "0.5.0"

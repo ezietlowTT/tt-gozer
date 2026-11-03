@@ -122,3 +122,14 @@ def no_real_proc(monkeypatch):
         return real(proc_root, *args, **kwargs)
 
     monkeypatch.setattr(procfd, "holders", guarded)
+
+
+@pytest.fixture(autouse=True)
+def no_real_names_file(monkeypatch, tmp_path):
+    """Point GOZER_NAMES at a path that does not exist.
+
+    Without this the default is the real ~/.config/gozer/names.toml, so a test
+    would pass or fail depending on whether the person running it has named
+    their boards. A test that wants a names file sets GOZER_NAMES itself.
+    """
+    monkeypatch.setenv("GOZER_NAMES", str(tmp_path / "no-names-file.toml"))

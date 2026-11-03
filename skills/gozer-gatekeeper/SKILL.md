@@ -151,6 +151,12 @@ gozer acquire --exact <chip-or-board> --who "human:cleanup" --reason "reset afte
 gozer release <new-lease-id>
 ```
 
+`<chip-or-board>` can be a name from the machine's names file (`left`, `right.1`). Use
+`gozer names` to see which name is which serial and PCI address. `status` and `topology`
+print the name beside each board and chip. When someone reports "board 0" or "chip 2",
+ask which: a device index is a position and can change, and gozer's own board order
+follows the names file when there is one, then serial for boards without a name.
+
 `--fresh` is safe either way: it only ever hands out units marked clean by a
 release that really did reset them.
 

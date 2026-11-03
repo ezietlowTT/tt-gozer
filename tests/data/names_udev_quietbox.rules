@@ -1,0 +1,12 @@
+# /dev/tenstorrent/by-name links, made by `gozer names udev`.
+# Each link follows the chip with that ASIC id, whatever index it gets.
+#
+# Install (needs root; gozer does not do this):
+#   gozer names udev | sudo tee /etc/udev/rules.d/60-tenstorrent-by-name.rules >/dev/null
+#   sudo udevadm control --reload
+#   sudo udevadm trigger --subsystem-match=tenstorrent --action=change
+
+SUBSYSTEM=="tenstorrent", ATTR{tt_asic_id}=="1111111111111111", SYMLINK+="tenstorrent/by-name/left-0"
+SUBSYSTEM=="tenstorrent", ATTR{tt_asic_id}=="2222222222222222", SYMLINK+="tenstorrent/by-name/left-1"
+SUBSYSTEM=="tenstorrent", ATTR{tt_asic_id}=="3333333333333333", SYMLINK+="tenstorrent/by-name/right-0"
+SUBSYSTEM=="tenstorrent", ATTR{tt_asic_id}=="4444444444444444", SYMLINK+="tenstorrent/by-name/right-1"

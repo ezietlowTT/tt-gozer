@@ -1,3 +1,12 @@
+tt-gozer (0.5.0) unstable; urgency=medium
+
+  * Stable names for boards and chips. A names file gives each board a name;
+    acquire, run and adopt take `left` and `right.1`, status and topology show
+    the names, and `gozer names`, `names set`, `names unset` and `names udev`
+    manage them. New exit status 21 for names problems.
+
+ -- Taylor Singletary <tsingletary@tenstorrent.com>  Tue, 03 Nov 2026 12:00:00 -0800
+
 tt-gozer (0.4.0) unstable; urgency=medium
 
   * First Debian package. Installs the gozer command, the three Claude Code
