@@ -655,9 +655,15 @@ def cmd_reconcile(args) -> int:
                "sudo": bool(args.sudo), "reaped": reaped,
                "fence_violations": violations}
     human = "\n".join(f"chip {s.chip.dev_index}  {s.state}" for s in states)
+    # Log each breach once, not on every run of the optional 5-minute timer.
+    logged = {(r.get("lease_id"), r.get("pid"), r.get("dev_index"))
+              for r in history.read(gk.history_root)[-2000:]
+              if r.get("event") == "fence_violation"} if violations else set()
     for v in violations:
         human += (f"\noutside its grant: pid {v['pid']} of lease {v['lease_id']} "
                   f"({v['who']}) holds device {v['dev_index']} ({v['bdf']})")
+        if (v["lease_id"], v["pid"], v["dev_index"]) in logged:
+            continue
         history.log(gk.history_root, "fence_violation", lease_id=v["lease_id"],
                     who=v["who"], pid=v["pid"], dev_index=v["dev_index"],
                     bdf=v["bdf"], held_by=v["held_by"], seen_by="reconcile")

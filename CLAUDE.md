@@ -843,6 +843,19 @@ pid was not in the fake /proc, and was rewritten to put it there. Hardware: `goz
 0000:01:00.0` of a command opening `/dev/tenstorrent/0` and `/2` warned at 5 s, logged one
 `fence_violation` naming device 2, and released normally.
 
+A third independent review found false positives, each proved with a test: a process belonging to
+two leases (one supervisor owning a lease per model, or `gozer run` started under a supervised lease)
+was reported against the lease that did not cover its device; `lease_member` matched the owner's
+recorded process group, which for a `gozer run` started without job control is the launcher's, so
+the launcher's own leased device was blamed on the run; during a die-grain release the borrowed
+partner lock (same lease_id, the releaser's pid) could be taken as the lease's record, and the
+partner device being reset counted as outside the grant. Fixes: a process is reported only when no
+lease it belongs to holds the device; `lease_member` uses the owner pid and its descendants only
+(reconcile's own leniency still uses the group); `_leases_by_id` gathers every unit locked under a
+lease_id and prefers the non-borrowed record; `reconcile` logs each (lease, pid, device) breach once.
+The reviewer's four tests pass on the fix; mutations (no shared-member skip, process group back)
+each red after one test was tightened to give the two leases different groups.
+
 Not done: no check for `--owner-pid` supervisors beyond `status`/`reconcile` (they have no gozer
 process running alongside); processes of other users are invisible without `--sudo`, as for every
 fd check.
