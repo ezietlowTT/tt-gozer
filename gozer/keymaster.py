@@ -140,7 +140,8 @@ class Keymaster:
                 expect: str | None = None, pid: int | None = None,
                 ticket: str | None = None, no_queue: bool = False,
                 owner_pid: int | None = None,
-                include_degraded: bool = False):
+                include_degraded: bool = False,
+                service: dict | None = None):
         """Return a Grant, a queue-ticket dict, or None.
 
         `owner_pid` is the supervisor pid the caller asked to hold the lease
@@ -199,6 +200,7 @@ class Keymaster:
             "exact": exact, "fresh": fresh,
             "reason": reason, "expect": expect,
             "owner_pid": owner_pid,
+            "service": service,
         }
 
         with self.gk.critical_section():
@@ -263,6 +265,8 @@ class Keymaster:
                 "reset_on_release": True,
                 "state": "active",
             }
+            if service:
+                lease["service"] = service
 
             for unit in units:
                 if not self.gk.claim_unit(unit, lease):
