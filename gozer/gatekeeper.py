@@ -538,7 +538,108 @@ class Gatekeeper:
 
     @property
     def grain(self) -> str:
+        """The lease unit: "board" or "chip".
+
+        Derived from the topology (lease_grain) unless the box has a grain
+        setting (`gozer grain set`). The setting lives in GOZER_ROOT beside
+        the gate, not in the environment: every gozer process on the box must
+        agree on the unit, or a board lock and a chip lock on the same silicon
+        would not exclude each other."""
+        setting = self.grain_setting()
+        if setting in ("board", "chip"):
+            return setting
         return lease_grain(self.boards)
+
+    # ---- grain setting ------------------------------------------------------
+
+    GRAIN_SETTINGS = ("auto", "board", "chip")
+
+    def _grain_path(self) -> str:
+        return os.path.join(self.root, "grain")
+
+    def grain_setting(self) -> str:
+        """"auto" unless `gozer grain set` chose "board" or "chip"."""
+        try:
+            with open(self._grain_path()) as f:
+                value = f.read().strip()
+        except OSError:
+            return "auto"
+        return value if value in self.GRAIN_SETTINGS else "auto"
+
+    def set_grain(self, value: str) -> str | None:
+        """Change the grain setting. Returns None, or why it was refused.
+
+        Refused while any unit is locked or any ticket is queued: their keys
+        (board serials or chip BDFs) belong to the grain they were taken
+        under, and a lock in the old grain would not exclude a lease in the
+        new one."""
+        if value not in self.GRAIN_SETTINGS:
+            return f"unknown grain {value!r} (want one of {', '.join(self.GRAIN_SETTINGS)})"
+        with self.critical_section():
+            if self.held_units():
+                return "units are leased; release every lease first"
+            if self.queue_entries():
+                return "tickets are queued; wait for the queue to empty"
+            path = self._grain_path()
+            if value == "auto":
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(path)
+            else:
+                tmp = f"{path}.tmp.{os.getpid()}"
+                with open(tmp, "w") as f:
+                    f.write(value + "\n")
+                os.replace(tmp, path)
+        return None
+
+    # ---- boards shared by several units --------------------------------------
+
+    def board_of(self, unit_key: str) -> Board | None:
+        chips = self.chips_in_unit(unit_key)
+        if not chips:
+            return None
+        return next((b for b in self.boards if b.serial == chips[0].serial),
+                    None)
+
+    def partner_units(self, units: list[str]) -> list[str]:
+        """At chip grain, the other units on the boards these units sit on.
+
+        A p300c board carries two dies joined by an on-board Ethernet link.
+        Resetting one die on its own leaves that link down: single-die work
+        on either die still runs, but a mesh over both dies does not form
+        again until the whole board is reset (measured 2026-11-11, see the
+        project CLAUDE.md). Release uses this to reset the whole board when
+        it can. Empty at board grain, where a unit already is the board."""
+        if self.grain == "board":
+            return []
+        mine = set(units)
+        out: list[str] = []
+        for unit in units:
+            board = self.board_of(unit)
+            if board is None or len(board.chips) < 2:
+                continue
+            for chip in board.chips:
+                key = self.unit_key_for(chip)
+                if key not in mine and key not in out:
+                    out.append(key)
+        return out
+
+    def _split_marker(self, serial: str) -> str:
+        return os.path.join(self.root, "gate", f"{serial}.split")
+
+    def mark_split(self, serial: str) -> None:
+        """Record that a board's dies were reset separately, so its on-board
+        link may be down until a whole-board reset. Best effort, as
+        mark_clean."""
+        with contextlib.suppress(OSError):
+            with open(self._split_marker(serial), "w") as f:
+                f.write(utcnow() + "\n")
+
+    def clear_split(self, serial: str) -> None:
+        with contextlib.suppress(OSError):
+            os.unlink(self._split_marker(serial))
+
+    def is_split(self, serial: str) -> bool:
+        return os.path.exists(self._split_marker(serial))
 
     def unit_key_for(self, chip: Chip, grain: str | None = None) -> str:
         """Board serial at board grain, BDF at chip grain."""
