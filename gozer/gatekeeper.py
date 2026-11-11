@@ -550,6 +550,58 @@ class Gatekeeper:
             return setting
         return lease_grain(self.boards)
 
+    # ---- fence check --------------------------------------------------------
+
+    def lease_member(self, pid: int, lease: dict) -> bool:
+        """Does `pid` belong to this supervised lease: its owner, the owner's
+        process group, or a descendant of the owner? Detached leases have no
+        live owner to judge by, so nothing belongs to them."""
+        if lease.get("detached"):
+            return False
+        owner, pgid = lease.get("pid"), lease.get("pgid")
+        if pid == owner or (pgid and pid == pgid):
+            return True
+        return (owner is not None and owner > 1
+                and procfd.is_descendant(pid, owner, self.proc_root))
+
+    def fence_violations(self, fd_map: dict | None = None,
+                         lease_id: str | None = None) -> list[dict]:
+        """Processes of a supervised lease holding a device outside its grant.
+
+        A lease only advises: a server configured for four devices on a
+        one-board grant opens the neighbour's chips anyway, and with several
+        models side by side that is the collision that matters. Each entry
+        names the lease, the process, the device it should not have, and who
+        (if anyone) holds that device's unit. `lease_id` limits the check to
+        one lease (`gozer run` checks its own child)."""
+        if fd_map is None:
+            fd_map = procfd.holders(self.proc_root, use_sudo=self.use_sudo)
+        leases = {}
+        for lease in self.held_units().values():
+            lid = lease.get("lease_id")
+            if lid and lid not in leases and (lease_id is None or lid == lease_id):
+                leases[lid] = lease
+        by_index = {c.dev_index: c for c in all_chips(self.boards)}
+        out = []
+        for lid, lease in leases.items():
+            granted = {c.dev_index for u in lease.get("units", [])
+                       for c in self.chips_in_unit(u)}
+            for dev, pids in sorted(fd_map.items()):
+                if dev in granted:
+                    continue
+                for pid in pids:
+                    if not self.lease_member(pid, lease):
+                        continue
+                    chip = by_index.get(dev)
+                    holder = (self.unit_lease(self.unit_key_for(chip))
+                              if chip else None)
+                    out.append({
+                        "lease_id": lid, "who": lease.get("who"), "pid": pid,
+                        "dev_index": dev, "bdf": chip.bdf if chip else None,
+                        "held_by": (holder or {}).get("lease_id"),
+                        "held_by_who": (holder or {}).get("who")})
+        return out
+
     # ---- grain setting ------------------------------------------------------
 
     GRAIN_SETTINGS = ("auto", "board", "chip")
