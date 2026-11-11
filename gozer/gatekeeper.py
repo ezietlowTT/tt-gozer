@@ -868,8 +868,13 @@ class Gatekeeper:
           kept busy by one-board jobs. An --exact ticket reserves only its
           unit, and a --fresh one only clean units;
         * a ticket that could not fit even with every grantable unit free (it
-          wants more than the healthy box holds) reserves nothing, so it
-          cannot park the healthy boards for ever.
+          wants more than the healthy box holds, or counts on units it holds
+          itself) reserves nothing, so it cannot park the healthy boards for
+          ever;
+        * a blocked ticket holds units for at most
+          queue.RESERVE_BLOCKED_MAX_SECONDS from its `since`, so a waiter
+          behind a lease that never ends (a long-running server) stops idling
+          the rest of the box; it keeps its place in line.
 
         Returns ({unit: ticket}, [tickets that fit]). Read-only on disk apart
         from free_units()'s documented reap, which is skipped when `free` is
@@ -881,14 +886,18 @@ class Gatekeeper:
         fits: list[str] = []
         now = utcnow()
         grantable = None
+        held = None
         for rec in self.queue_entries():
             if before_seq is not None and rec.get("seq", 0) >= before_seq:
                 break
             if not self.queue.is_active(rec, now):
                 continue
             ticket = rec.get("ticket")
-            lo = int(rec.get("min_chips") or 1)
-            hi = int(rec.get("max_chips") or lo)
+            try:
+                lo = int(rec.get("min_chips") or 1)
+                hi = int(rec.get("max_chips") or lo)
+            except (TypeError, ValueError):
+                continue          # a corrupt ticket holds nothing
             exact, fresh = rec.get("exact"), bool(rec.get("fresh"))
             avail = [u for u in free if u not in reserved]
             units = self._select(avail, lo, hi, exact=exact, fresh=fresh)
@@ -897,15 +906,30 @@ class Gatekeeper:
                     reserved[u] = ticket
                 fits.append(ticket)
                 continue
+
+            # Blocked. Hold units only while that can end in a grant.
+            if not self.queue.may_hold_while_blocked(rec, now):
+                continue
             if grantable is None:
                 grantable = self.grantable_units()
-            if self._select(grantable, lo, hi, exact=exact) is None:
+                held = self.held_units()
+            # Units the waiter itself holds will not free while it waits
+            # (hold-and-wait), so they do not count towards a future fit.
+            mine = {u for u, lease in held.items()
+                    if (rec.get("who") and lease.get("who") == rec.get("who"))
+                    or (rec.get("owner_pid")
+                        and lease.get("pid") == rec.get("owner_pid"))}
+            if self._select([u for u in grantable if u not in mine],
+                            lo, hi, exact=exact) is None:
                 continue
             if exact is not None:
                 unit = self._resolve_exact(exact)
                 usable = [unit] if unit in avail else []
             else:
-                usable = [u for u in avail if not fresh or self.is_clean(u)]
+                usable = list(avail)
+            # A --fresh waiter can only ever take clean units; holding a dirty
+            # one would also stop the lease-and-release that would clean it.
+            usable = [u for u in usable if not fresh or self.is_clean(u)]
             for u in usable:
                 reserved[u] = ticket
         return reserved, fits
@@ -969,9 +993,9 @@ class Gatekeeper:
         """See TicketQueue.prune."""
         return self.queue.prune()
 
-    def touch_ticket(self, ticket: str) -> None:
+    def touch_ticket(self, ticket: str, min_interval: float = 0) -> None:
         """See TicketQueue.touch."""
-        return self.queue.touch(ticket)
+        return self.queue.touch(ticket, min_interval=min_interval)
 
     # ---- claim window -------------------------------------------------------
 

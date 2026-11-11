@@ -67,10 +67,25 @@ TICKET_MAX_AGE_SECONDS = 3600
 # ticket cannot idle the box for the full TICKET_MAX_AGE_SECONDS.
 RESERVE_ACTIVE_SECONDS = 600
 
+# How long a ticket that does not fit yet may hold free units back, counted
+# from `since` (which _send_to_back keeps). Holding is what stops a big
+# request starving behind small ones; the cap is what stops a big request
+# behind a lease that never ends -- a 24/7 model server -- from idling the
+# rest of the box for as long as it keeps polling. After the cap the waiter
+# keeps its place in line but behaves as before reservations existed.
+RESERVE_BLOCKED_MAX_SECONDS = 3600
+
+# `acquire --ticket` is how `gozer wait` polls, once a second; refreshing
+# `seen_at` on every poll would rewrite the ticket file every second.
+TOUCH_MIN_INTERVAL_SECONDS = 30
+
 
 def last_seen(rec: dict) -> str | None:
     """The ticket's latest sign of life: its last poll, else its creation."""
-    stamps = [t for t in (rec.get("since"), rec.get("seen_at")) if t]
+    # Strings only: a hand-edited number here must not raise in every
+    # acquire; a ticket with no usable stamp is judged ancient instead.
+    stamps = [t for t in (rec.get("since"), rec.get("seen_at"))
+              if isinstance(t, str) and t]
     return max(stamps) if stamps else None
 
 
@@ -199,7 +214,7 @@ class TicketQueue:
             if self._claim_window_ticket() == ticket:
                 self._close_claim_window()
 
-    def touch(self, ticket: str) -> None:
+    def touch(self, ticket: str, min_interval: float = 0) -> None:
         """Record that this ticket's waiter is still polling (`seen_at`).
 
         Keeps a correctly-polling waiter from aging out behind a long lease,
@@ -211,9 +226,22 @@ class TicketQueue:
             rec = _read_json(path) if path else None
             if not rec:
                 return
+            now = utcnow()
+            seen = rec.get("seen_at")
+            if (min_interval and isinstance(seen, str) and seen
+                    and _elapsed_seconds(seen, now) < min_interval):
+                return
             rec = dict(rec)
-            rec["seen_at"] = utcnow()
+            rec["seen_at"] = now
             _atomic_write_json(path, rec)
+
+    def may_hold_while_blocked(self, rec: dict, now: str | None = None) -> bool:
+        """May a ticket that does not fit yet still hold units back?"""
+        since = rec.get("since")
+        if not isinstance(since, str) or not since:
+            return False
+        return (_elapsed_seconds(since, now or utcnow())
+                <= RESERVE_BLOCKED_MAX_SECONDS)
 
     def is_active(self, rec: dict, now: str | None = None) -> bool:
         """Has this ticket's waiter polled within RESERVE_ACTIVE_SECONDS?"""

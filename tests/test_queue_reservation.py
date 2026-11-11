@@ -212,3 +212,106 @@ def test_status_and_queue_show_what_a_waiter_holds(tmp_path, sysfs, monkeypatch,
     assert cli.main(["status"]) == 0
     out = capsys.readouterr().out
     assert f"holding {a.units[0]}" in out
+
+
+# ---- Review findings (2026-11-11) -----------------------------------------
+
+B1 = "0000000000000002"   # chips 0,1 in QUIETBOX
+B2 = "0000000000000001"   # chips 2,3
+
+
+def test_exact_fresh_waiter_does_not_hold_a_dirty_board(tmp_path, sysfs):
+    """It could never take the board, and holding it would stop the
+    lease-and-release that cleans it: a permanent stall."""
+    km, gk = make(tmp_path, sysfs)
+    assert not gk.is_clean(B2)
+    t = km.acquire("1", who="claude:fresh", pid=1, exact="0000:03:00.0",
+                   fresh=True)
+    assert not isinstance(t, Grant)
+    other = km.acquire("1", who="claude:other", pid=1, exact="0000:03:00.0")
+    assert isinstance(other, Grant)
+    km.release(other.lease_id)                 # the reset cleans B2
+    got = km.acquire("1", who="claude:fresh", exact="0000:03:00.0",
+                     fresh=True, ticket=t["ticket"])
+    assert isinstance(got, Grant)
+
+
+def test_an_unknown_ticket_is_held_to_every_reservation(tmp_path, sysfs):
+    km, gk = make(tmp_path, sysfs)
+    a = km.acquire("1", who="claude:a", pid=1)
+    km.acquire("1", who="claude:b", pid=1)
+    big = km.acquire("all", who="claude:big", pid=1)
+    km.release(a.lease_id)
+    _expire_claim_window(gk)
+    import pytest
+    from gozer.keymaster import TicketNotFound
+    with pytest.raises(TicketNotFound):
+        km.acquire("1", who="claude:jumper", pid=1, ticket="ffff")
+    assert gk.queue_position(big["ticket"]) == 1
+
+
+def test_a_blocked_waiter_stops_holding_after_the_cap(tmp_path, sysfs):
+    """Behind a lease that never ends, a polling whole-box waiter must not
+    idle the other board for ever. It keeps its place."""
+    km, gk = make(tmp_path, sysfs)
+    km.acquire("1", who="vllm", pid=1)                 # never released
+    big = km.acquire("all", who="claude:big", pid=1)
+    early = km.acquire("1", who="claude:early", pid=1)
+    assert not isinstance(early, Grant)                # big holds the board
+    _age_ticket(gk, big["ticket"], queue_mod.RESERVE_BLOCKED_MAX_SECONDS + 60,
+                "since")
+    gk.touch_ticket(big["ticket"])                     # still polling
+    got = km.acquire("1", who="claude:early", ticket=early["ticket"])
+    assert isinstance(got, Grant)
+    assert gk.queue_position(big["ticket"]) == 1
+
+
+def test_a_waiter_does_not_hold_units_counting_on_its_own_lease(tmp_path, sysfs):
+    """Hold-and-wait: it holds B1 and asks for all; it can never fit while it
+    holds B1, so it must not park B2 too."""
+    km, gk = make(tmp_path, sysfs)
+    km.acquire("1", who="claude:x", pid=1)
+    t = km.acquire("all", who="claude:x", pid=1)
+    reserved, _ = gk.plan_queue()
+    assert reserved == {}
+    assert isinstance(km.acquire("1", who="claude:y", pid=1), Grant)
+    assert gk.queue_position(t["ticket"]) == 1
+
+
+def test_window_holder_keeps_its_window_when_a_ticket_ahead_wakes(tmp_path, sysfs):
+    km, gk = make(tmp_path, sysfs)
+    a = km.acquire("1", who="claude:a", pid=1)
+    km.acquire("1", who="claude:b", pid=1)
+    big = km.acquire("all", who="claude:big", pid=1)
+    small = km.acquire("1", who="claude:small", pid=1)
+    for f in ("since", "seen_at"):
+        _age_ticket(gk, big["ticket"], queue_mod.RESERVE_ACTIVE_SECONDS + 60, f)
+    km.release(a.lease_id)
+    assert gk.queue._claim_window_ticket() == small["ticket"]
+    gk.touch_ticket(big["ticket"])                     # big wakes up
+    got = km.acquire("1", who="claude:small", ticket=small["ticket"])
+    assert isinstance(got, Grant)
+
+
+def test_polling_does_not_rewrite_the_ticket_every_time(tmp_path, sysfs):
+    km, gk = make(tmp_path, sysfs)
+    km.acquire("all", who="claude:a", pid=1)
+    t = km.acquire("1", who="claude:waiter", pid=1)
+    path = gk.queue._ticket_path(t["ticket"])
+    before = os.stat(path).st_mtime_ns
+    km.acquire("1", who="claude:waiter", ticket=t["ticket"])
+    assert os.stat(path).st_mtime_ns == before
+
+
+def test_a_corrupt_ticket_does_not_break_acquire(tmp_path, sysfs):
+    import json
+    km, gk = make(tmp_path, sysfs)
+    a = km.acquire("1", who="claude:a", pid=1)
+    t = km.acquire("all", who="claude:bad", pid=1)
+    path = gk.queue._ticket_path(t["ticket"])
+    rec = json.load(open(path))
+    rec["seen_at"] = 12345
+    rec["min_chips"] = "lots"
+    json.dump(rec, open(path, "w"))
+    assert isinstance(km.acquire("1", who="claude:ok", pid=1), Grant)
+    km.release(a.lease_id)

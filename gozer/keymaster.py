@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from gozer import history, procfd
+from gozer import queue as queue_mod
 from gozer import reset as reset_mod
 from gozer.gatekeeper import Gatekeeper, parse_chip_request, utcnow
 from gozer.jsonstore import _elapsed_seconds
@@ -200,7 +201,8 @@ class Keymaster:
             if ticket:
                 # Every replay of a ticket is its waiter polling: keep it
                 # alive and keep its reservation (queue.RESERVE_ACTIVE_SECONDS).
-                self.gk.touch_ticket(ticket)
+                self.gk.touch_ticket(
+                    ticket, min_interval=queue_mod.TOUCH_MIN_INTERVAL_SECONDS)
 
             # A ticket-holder outside its claim window must wait its turn, and a
             # newcomer must not jump an open window.
@@ -213,14 +215,20 @@ class Keymaster:
             # reset-all (include_degraded) is exempt: it never queues, needs
             # the whole box, and returns it reset moments later.
             reserved: dict[str, str] = {}
-            if not include_degraded:
+            # The claim-window holder was picked by release as the first
+            # ticket the freed units fit; a ticket ahead that has polled since
+            # must not take the units back from under it mid-window.
+            holds_window = bool(ticket) and (
+                self.gk.queue._claim_window_ticket() == ticket)
+            if not include_degraded and not holds_window:
                 own_seq = None
                 if ticket:
                     own_seq = next((e.get("seq") for e in self.gk.queue_entries()
                                     if e.get("ticket") == ticket), None)
-                if not ticket or own_seq is not None:
-                    reserved, _ = self.gk.plan_queue(free=free,
-                                                     before_seq=own_seq)
+                # An unknown ticket is a newcomer: every reservation applies.
+                # (It is refused as TicketNotFound if it does not fit anyway.)
+                reserved, _ = self.gk.plan_queue(free=free,
+                                                 before_seq=own_seq)
             units = self.gk.allocate(min_chips, max_chips, exact=exact, fresh=fresh,
                                      include_degraded=include_degraded,
                                      exclude=reserved, free=free)

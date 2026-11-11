@@ -714,6 +714,27 @@ aging tests now backdate `seen_at` with `since`. Full suite 717. Version not bum
 boards"), and `--json` adds `active` and `holding` per entry; computed from a reap=False reconcile,
 so looking still never reaps.
 
+An independent review (fresh subagent, adversarial, tests in a scratch dir) then found, with proving
+tests: an `--exact --fresh` waiter held a dirty board forever (it could never take it, and holding it
+stopped the lease-and-release that cleans it); an unknown or pruned `--ticket` skipped every
+reservation; a polling blocked waiter held units with no time limit behind a lease that never ends,
+or behind its own lease (hold-and-wait); a window holder was refused inside its own window when a
+ticket ahead woke up, then demoted; `wait` rewrote the ticket file every second; a non-string
+`seen_at` or non-integer `min_chips` broke every acquire. Fixes: `--fresh` holds clean units only,
+on both paths; an unknown ticket is planned as a newcomer; a blocked ticket holds units for at most
+`RESERVE_BLOCKED_MAX_SECONDS` (3600) from `since` and never counts units leased to its own `who` or
+owner pid; the window holder skips reservations; `touch` from `acquire` is throttled to
+`TOUCH_MIN_INTERVAL_SECONDS` (30); `last_seen` ignores non-strings and a ticket with corrupt counts
+holds nothing. Seven tests in `tests/test_queue_reservation.py`; the reviewer's five tests, which
+assert the bad behaviour, all fail now.
+
+Hardware (2x p300c, dev sandbox state): the whole-box scenario; an `--exact` waiter on a busy board
+does not hold the other board and gets the window when its board frees; `gozer run` while busy exits
+10 with a ticket; an idle waiter keeps its place while a newcomer passes it, and becomes active again
+on its next poll; `reset-all` is refused while a claim window is open and runs while a waiter holds
+the whole box, which then gets all 4 chips.
+
 Not done: the window is still exclusive, so while a fitting ticket holds it, another ticket that
-fits the remaining units waits up to 90 s.
+fits the remaining units waits up to 90 s. An unknown `--ticket` that fits free, unreserved chips is
+granted rather than refused with 13 (as before this change).
 
