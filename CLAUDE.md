@@ -710,7 +710,10 @@ TDD: `tests/test_queue_reservation.py` (8 tests, red before). Three mutations (n
 acquire, window to the head regardless, no touch on replay) each turn tests red. Three existing
 aging tests now backdate `seen_at` with `since`. Full suite 717. Version not bumped.
 
-Not done: `status`/`queue` do not show which units a ticket is holding; the window is still
-exclusive, so while a fitting ticket holds it, another ticket that fits the remaining units waits
-up to 90 s.
+`status` and `queue` show each waiter's held units ("holding <board>", or "idle: not holding
+boards"), and `--json` adds `active` and `holding` per entry; computed from a reap=False reconcile,
+so looking still never reaps.
+
+Not done: the window is still exclusive, so while a fitting ticket holds it, another ticket that
+fits the remaining units waits up to 90 s.
 

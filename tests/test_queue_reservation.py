@@ -188,3 +188,27 @@ def test_unpolled_ticket_still_ages_out(tmp_path, sysfs):
     _age_ticket(gk, t["ticket"], queue_mod.TICKET_MAX_AGE_SECONDS + 60, "seen_at")
     gk.prune_queue()
     assert gk.queue_position(t["ticket"]) is None
+
+
+def test_status_and_queue_show_what_a_waiter_holds(tmp_path, sysfs, monkeypatch, capsys):
+    """Reservations are visible, and looking at them reaps nothing."""
+    import json
+    from gozer import cli
+    km, gk = make(tmp_path, sysfs)
+    a = km.acquire("1", who="claude:a", pid=1)
+    km.acquire("1", who="claude:b", pid=1)
+    big = km.acquire("all", who="claude:big", pid=1)
+    km.release(a.lease_id)
+
+    monkeypatch.setenv("GOZER_ROOT", gk.root)
+    monkeypatch.setenv("GOZER_SYSFS_ROOT", gk.sysfs_root)
+    monkeypatch.setenv("GOZER_PROC_ROOT", gk.proc_root)
+    assert cli.main(["queue", "--json"]) == 0
+    q = json.loads(capsys.readouterr().out)["queue"]
+    assert q[0]["ticket"] == big["ticket"]
+    assert q[0]["active"] is True
+    assert q[0]["holding"] == a.units
+
+    assert cli.main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert f"holding {a.units[0]}" in out
