@@ -782,7 +782,8 @@ class Gatekeeper:
 
     def allocate(self, min_chips: int, max_chips: int, exact: str | None = None,
                  fresh: bool = False,
-                 include_degraded: bool = False) -> list[str] | None:
+                 include_degraded: bool = False,
+                 exclude=(), free: list[str] | None = None) -> list[str] | None:
         """Choose unit keys satisfying the request, or None.
 
         Does not claim: it never calls claim_unit, so the returned keys are
@@ -798,8 +799,22 @@ class Gatekeeper:
         free?". That's deliberate housekeeping, not selection -- see the
         comment on free_units() -- but it does mean allocate() is not a pure
         read: it can delete another tenant's dead lease file.
+
+        `exclude` drops units reserved for tickets ahead of the caller (see
+        plan_queue). `free` lets a caller that already computed free_units()
+        pass it in instead of reconciling a second time.
         """
-        free = self.free_units(include_degraded=include_degraded)
+        if free is None:
+            free = self.free_units(include_degraded=include_degraded)
+        excluded = set(exclude)
+        return self._select([u for u in free if u not in excluded],
+                            min_chips, max_chips, exact=exact, fresh=fresh)
+
+    def _select(self, free: list[str], min_chips: int, max_chips: int,
+                exact: str | None = None,
+                fresh: bool = False) -> list[str] | None:
+        """allocate()'s choice over a given list of free units. Pure: no
+        reconcile, no disk."""
         if fresh:
             free = [u for u in free if self.is_clean(u)]
 
@@ -825,6 +840,75 @@ class Gatekeeper:
             count += size
 
         return chosen if count >= min_chips else None
+
+    def grantable_units(self) -> list[str]:
+        """Units an ordinary request could ever be granted: none of their
+        chips is on a short (DEGRADED) board. Held units count -- they free
+        up eventually; a degraded one does not without a reset-all."""
+        return [u for u in self.all_units()
+                if self.chips_in_unit(u)
+                and not any(self.short_board_of(c)
+                            for c in self.chips_in_unit(u))]
+
+    def plan_queue(self, free: list[str] | None = None,
+                   before_seq: int | None = None
+                   ) -> tuple[dict[str, str], list[str]]:
+        """Which free units the queue holds back, and which tickets fit now.
+
+        Walks the queue in FIFO order (only tickets with seq < before_seq,
+        when given), considering only *active* tickets -- ones whose waiter
+        polled within queue.RESERVE_ACTIVE_SECONDS:
+
+        * a ticket whose request fits in the free units not yet reserved
+          reserves exactly the units it would be granted, and is listed in
+          `fits` (release opens the claim window for the first of them);
+        * a ticket that does not fit yet reserves the free units it could use
+          towards its request, so a smaller request behind it cannot keep
+          taking them -- that was how a `--chips all` waiter starved on a box
+          kept busy by one-board jobs. An --exact ticket reserves only its
+          unit, and a --fresh one only clean units;
+        * a ticket that could not fit even with every grantable unit free (it
+          wants more than the healthy box holds) reserves nothing, so it
+          cannot park the healthy boards for ever.
+
+        Returns ({unit: ticket}, [tickets that fit]). Read-only on disk apart
+        from free_units()'s documented reap, which is skipped when `free` is
+        passed in.
+        """
+        if free is None:
+            free = self.free_units()
+        reserved: dict[str, str] = {}
+        fits: list[str] = []
+        now = utcnow()
+        grantable = None
+        for rec in self.queue_entries():
+            if before_seq is not None and rec.get("seq", 0) >= before_seq:
+                break
+            if not self.queue.is_active(rec, now):
+                continue
+            ticket = rec.get("ticket")
+            lo = int(rec.get("min_chips") or 1)
+            hi = int(rec.get("max_chips") or lo)
+            exact, fresh = rec.get("exact"), bool(rec.get("fresh"))
+            avail = [u for u in free if u not in reserved]
+            units = self._select(avail, lo, hi, exact=exact, fresh=fresh)
+            if units:
+                for u in units:
+                    reserved[u] = ticket
+                fits.append(ticket)
+                continue
+            if grantable is None:
+                grantable = self.grantable_units()
+            if self._select(grantable, lo, hi, exact=exact) is None:
+                continue
+            if exact is not None:
+                unit = self._resolve_exact(exact)
+                usable = [unit] if unit in avail else []
+            else:
+                usable = [u for u in avail if not fresh or self.is_clean(u)]
+            for u in usable:
+                reserved[u] = ticket
+        return reserved, fits
 
     def eth_neighbours(self, units: list[str]) -> dict[str, str]:
         """Leased chips sharing a board with the selection but not part of it.
@@ -884,6 +968,10 @@ class Gatekeeper:
     def prune_queue(self) -> list[str]:
         """See TicketQueue.prune."""
         return self.queue.prune()
+
+    def touch_ticket(self, ticket: str) -> None:
+        """See TicketQueue.touch."""
+        return self.queue.touch(ticket)
 
     # ---- claim window -------------------------------------------------------
 

@@ -395,6 +395,7 @@ def cmd_acquire(args) -> int:
 def cmd_wait(args) -> int:
     gk, km = _make(args)
     deadline = time.monotonic() + parse_duration(args.timeout)
+    last_touch = None
     while time.monotonic() < deadline:
         entry = next((e for e in gk.queue_entries()
                       if e["ticket"] == args.ticket), None)
@@ -402,6 +403,12 @@ def cmd_wait(args) -> int:
             _emit({"granted": False, "ticket": args.ticket, "reason": "gone"},
                   f"ticket {args.ticket} is no longer queued", args.json)
             return EXIT_NO_LEASE
+        # A waiting ticket is a live one: refresh `seen_at` (at most every
+        # 30 s, not every poll) so it neither ages out behind a long lease
+        # nor loses the units it holds back for itself.
+        if last_touch is None or time.monotonic() - last_touch >= 30:
+            gk.touch_ticket(args.ticket)
+            last_touch = time.monotonic()
         if gk.may_claim(args.ticket):
             # No explicit pid here either -- same detached lease as
             # cmd_acquire (see its comment). `wait` claims on behalf of

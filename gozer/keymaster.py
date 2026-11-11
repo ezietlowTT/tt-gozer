@@ -197,14 +197,33 @@ class Keymaster:
 
         with self.gk.critical_section():
             self.gk.prune_queue()
+            if ticket:
+                # Every replay of a ticket is its waiter polling: keep it
+                # alive and keep its reservation (queue.RESERVE_ACTIVE_SECONDS).
+                self.gk.touch_ticket(ticket)
 
             # A ticket-holder outside its claim window must wait its turn, and a
             # newcomer must not jump an open window.
             if not self.gk.may_claim(ticket):
                 return self._queue_or_refuse(ticket, request, no_queue)
 
+            free = self.gk.free_units(include_degraded=include_degraded)
+            # Units held back for active tickets ahead of this caller: every
+            # ticket for a newcomer, the earlier ones for a ticket-holder.
+            # reset-all (include_degraded) is exempt: it never queues, needs
+            # the whole box, and returns it reset moments later.
+            reserved: dict[str, str] = {}
+            if not include_degraded:
+                own_seq = None
+                if ticket:
+                    own_seq = next((e.get("seq") for e in self.gk.queue_entries()
+                                    if e.get("ticket") == ticket), None)
+                if not ticket or own_seq is not None:
+                    reserved, _ = self.gk.plan_queue(free=free,
+                                                     before_seq=own_seq)
             units = self.gk.allocate(min_chips, max_chips, exact=exact, fresh=fresh,
-                                     include_degraded=include_degraded)
+                                     include_degraded=include_degraded,
+                                     exclude=reserved, free=free)
             if units is None:
                 return self._queue_or_refuse(ticket, request, no_queue)
 
@@ -513,14 +532,20 @@ class Keymaster:
                 self.gk.release_unit(unit, expected_lease_id=lease_id)
             self.gk.delete_lease(lease_id)
 
-            # Hand the freed chips to whoever is next in line. Prune first so
-            # a ticket whose waiter is demonstrably gone cannot be handed a
-            # 90-second exclusive window nobody will ever claim.
+            # Hand the freed chips to the first waiter they actually fit.
+            # Prune first so a ticket whose waiter is demonstrably gone cannot
+            # be handed a 90-second exclusive window nobody will ever claim.
+            # The head used to get the window unconditionally: a head that
+            # wanted more than was free blocked everyone for 90 s, then was
+            # sent to the back of the queue. A head that does not fit now
+            # keeps its place and holds the freed units instead (plan_queue).
             self.gk.prune_queue()
-            head = self.gk.queue_entries()
-            if head:
-                self.gk.open_claim_window(head[0]["ticket"])
-                messages.append(f"claim window opened for {head[0]['who']}")
+            _, fits = self.gk.plan_queue()
+            if fits:
+                who = next((e["who"] for e in self.gk.queue_entries()
+                            if e["ticket"] == fits[0]), fits[0])
+                self.gk.open_claim_window(fits[0])
+                messages.append(f"claim window opened for {who}")
 
         since = lease.get("since")
         duration_s = _elapsed_seconds(since, utcnow()) if since else None
