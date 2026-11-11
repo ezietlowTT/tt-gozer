@@ -783,5 +783,27 @@ Built from that (branch `die-grain`, stacked on the queue PR):
   board split; the partner's release reset the whole board, cleared the mark, and a 1x2 mesh then
   formed on it.
 
+A second independent review (fresh subagent, proving tests run on a `git archive` copy) found no
+lock leak and no race between the partner free-check and its claim, and eight bookkeeping bugs:
+a both-dies lease, a board-grain release and `reset-all` never cleared a split mark; a board reset
+whole was marked split when another board of the same lease had a busy partner; partners were
+borrowed all-or-nothing across boards; clean markers keyed under the old grain survived a grain
+switch, so `--fresh` could get a dirty die; the borrowed partner lock carried the releaser's record,
+so with a dead owner or an aged detached lease it was STALE at once and could be reaped and
+re-granted mid-reset, then marked clean under the new tenant; an interrupt during the reset left the
+partner locked. Fixes: `Gatekeeper.settle_split(reset_bdfs)` decides every touched board by what
+was actually reset (all its dies: clear; some: mark), used by release, in-place reset and
+reset-all; partners are borrowed per board; `set_grain` deletes all `*.clean` markers; the borrowed
+lock is owned by the releasing process (`pid` = its own, not detached, fresh `since`,
+`borrowed_for_reset`); a partner is marked clean only if its lock is still ours; a `finally` drops
+borrowed locks on any exit; a partner already locked under our own id (a killed release) is ours to
+reset. Ten tests added to `tests/test_die_grain.py` (24 in all); the reviewer's eight bug-asserting
+tests all fail on the fixed code; three mutations (borrowed lock = original record, clean without
+the ownership check, no finally) each red.
+
 Not done: the "partner's next open failed" case is handled only by the split mark and the next
 whole-board reset; gozer does not reset a die on grant. `eth_neighbours` warnings are unchanged.
+Two sibling dies released at the same moment each see the other leased, so both reset one die
+and the board stays split until its next whole-board reset (release of a single die later, a
+both-dies lease, a board-grain lease or reset-all all heal it). Concurrent single-die resets on
+one board are untested on hardware.

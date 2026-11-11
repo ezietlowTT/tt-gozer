@@ -206,3 +206,137 @@ def test_status_and_grant_explain_dies(cli_env, capsys):
     out = capsys.readouterr().out
     assert "grain: chip (set)" in out
     assert "dies reset separately" in out
+
+
+# ---- Review findings (2026-11-11, second review) -----------------------------
+
+A0, A1, B0, B1 = "0000:01:00.0", "0000:02:00.0", "0000:03:00.0", "0000:04:00.0"
+
+
+def test_a_both_dies_release_clears_the_split_mark(tmp_path, sysfs):
+    km, gk, resets = make(tmp_path, sysfs)
+    gk.mark_split(BOARD_A)
+    whole = km.acquire("2", who="mesh", pid=1)
+    assert sorted(whole.bdfs) == [A0, A1]
+    km.release(whole.lease_id)
+    assert not gk.is_split(BOARD_A)
+
+
+def test_reset_all_clears_split_marks(tmp_path, sysfs):
+    km, gk, _ = make(tmp_path, sysfs)
+    gk.mark_split(BOARD_A)
+    gk.mark_split(BOARD_B)
+    assert km.reset_all(who="ops").ok
+    assert not gk.is_split(BOARD_A) and not gk.is_split(BOARD_B)
+
+
+def test_a_board_grain_release_clears_a_split_left_from_chip_grain(tmp_path, sysfs):
+    km, gk, _ = make(tmp_path, sysfs, grain="board")
+    gk.mark_split(BOARD_A)
+    a = km.acquire("1", who="a", pid=1, exact=BOARD_A)
+    km.release(a.lease_id)
+    assert not gk.is_split(BOARD_A)
+
+
+def test_split_is_decided_per_board(tmp_path, sysfs):
+    """A board reset whole is healed even when another board of the same
+    lease could not be."""
+    km, gk, resets = make(tmp_path, sysfs)
+    km.acquire("1", who="other", pid=1, exact=B1)
+    mine = km.acquire("3", who="mine", pid=1)
+    assert sorted(mine.bdfs) == [A0, A1, B0]
+    km.release(mine.lease_id)
+    assert sorted(resets[-1]) == [A0, A1, B0]
+    assert not gk.is_split(BOARD_A)
+    assert gk.is_split(BOARD_B)
+
+
+def test_partners_are_borrowed_per_board(tmp_path, sysfs):
+    km, gk, resets = make(tmp_path, sysfs)
+    km.acquire("1", who="other", pid=1, exact=B1)
+    hold = km.acquire("1", who="h", pid=1, exact=A1)
+    two = km.acquire("2", who="two", pid=1)
+    assert sorted(two.bdfs) == [A0, B0]
+    km.release(hold.lease_id, no_reset=True)          # A1 now free, B1 still busy
+    km.release(two.lease_id)
+    assert sorted(resets[-1]) == [A0, A1, B0]         # A1 borrowed, B1 not
+    assert not gk.is_split(BOARD_A) and gk.is_split(BOARD_B)
+
+
+def test_changing_grain_forgets_clean_markers(tmp_path, sysfs):
+    km, gk, _ = make(tmp_path, sysfs)
+    a = km.acquire("1", who="a", pid=1, exact=A0)
+    km.release(a.lease_id)                            # A0, A1 clean (BDF keys)
+    assert gk.set_grain("board") is None
+    b = km.acquire("1", who="dirty", pid=1, exact=BOARD_A)
+    km.reset_runner = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "boom")
+    assert km.release_result(b.lease_id).status == "reset-failed"
+    assert gk.set_grain("chip") is None
+    g = km.acquire("1", who="fresh", pid=1, exact=A0, fresh=True, no_queue=True)
+    assert g is None                                  # not handed out as fresh
+
+
+def test_a_borrowed_partner_cannot_be_reaped_mid_reset(tmp_path, sysfs):
+    """The partner lock is owned by the releasing process, so a detached
+    lease past its grace window does not make it STALE."""
+    km, gk, resets = make(tmp_path, sysfs)
+    fake_proc_tree(tmp_path, {os.getpid(): {"ppid": 1}})   # the releaser is alive
+    # The lease's owner has exited (a supervisor that died, or `gozer
+    # release` run by hand afterwards): its own record is STALE.
+    a = km.acquire("1", who="a", pid=99999, exact=A0)
+    km2 = Keymaster(Gatekeeper(root=gk.root, sysfs_root=gk.sysfs_root,
+                               proc_root=gk.proc_root))
+    grabbed = {}
+
+    def runner(argv, **kw):
+        resets.append(argv[2].split(","))
+        grabbed["g"] = km2.acquire("1", who="intruder", pid=1, exact=A1,
+                                   no_queue=True)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    km.reset_runner = runner
+    assert km.release_result(a.lease_id).ok
+    assert A1 in resets[-1]
+    assert grabbed["g"] is None                            # refused mid-reset
+    assert gk.is_clean(A1) and gk.unit_lease(A1) is None
+
+
+def test_a_partner_regranted_mid_reset_is_not_marked_clean(tmp_path, sysfs, monkeypatch):
+    km, gk, resets = make(tmp_path, sysfs)
+    a = km.acquire("1", who="a", pid=1, exact=A0)
+    stranger = {"lease_id": "zzzzzz", "who": "intruder", "pid": 1}
+
+    def runner(argv, **kw):
+        resets.append(argv[2].split(","))
+        # Simulate the lock changing hands while tt-smi runs.
+        gk.release_unit(A1, expected_lease_id=a.lease_id)
+        gk.claim_unit(A1, stranger)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    km.reset_runner = runner
+    km.release_result(a.lease_id)
+    assert not gk.is_clean(A1)
+    assert gk.unit_lease(A1)["who"] == "intruder"
+
+
+def test_an_interrupted_reset_leaves_no_partner_lock(tmp_path, sysfs):
+    km, gk, resets = make(tmp_path, sysfs)
+    a = km.acquire("1", who="a", pid=1, exact=A0)
+
+    def boom(argv, **kw):
+        raise KeyboardInterrupt
+    km.reset_runner = boom
+    with pytest.raises(KeyboardInterrupt):
+        km.release_result(a.lease_id)
+    assert gk.unit_lease(A1) is None                  # borrowed lock settled
+    km.reset_runner = lambda argv, **kw: (resets.append(argv[2].split(",")),
+                                          subprocess.CompletedProcess(argv, 0, "", ""))[1]
+    assert km.release_result(a.lease_id).ok
+    assert sorted(resets[-1]) == [A0, A1] and not gk.is_split(BOARD_A)
+
+
+def test_a_partner_left_locked_under_our_own_id_is_ours_to_reset(tmp_path, sysfs):
+    km, gk, resets = make(tmp_path, sysfs)
+    a = km.acquire("1", who="a", pid=1, exact=A0)
+    gk.claim_unit(A1, gk.read_lease(a.lease_id))      # left by a killed release
+    km.release(a.lease_id)
+    assert sorted(resets[-1]) == [A0, A1]
+    assert gk.held_units() == {} and not gk.is_split(BOARD_A)

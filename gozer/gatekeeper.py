@@ -580,6 +580,18 @@ class Gatekeeper:
                 return "units are leased; release every lease first"
             if self.queue_entries():
                 return "tickets are queued; wait for the queue to empty"
+            # Clean markers are keyed by the unit of the grain they were
+            # written under (`<serial>.clean` or `<bdf>.clean`). Leases in the
+            # new grain never clear the old grain's markers, so one could
+            # outlive a later, unreset use of the same silicon and hand
+            # `--fresh` a dirty die. Forget them all: the cost is one
+            # unnecessary reset before the next --fresh grant.
+            gate = os.path.join(self.root, "gate")
+            with contextlib.suppress(OSError):
+                for entry in os.listdir(gate):
+                    if entry.endswith(".clean"):
+                        with contextlib.suppress(OSError):
+                            os.unlink(os.path.join(gate, entry))
             path = self._grain_path()
             if value == "auto":
                 with contextlib.suppress(FileNotFoundError):
@@ -640,6 +652,30 @@ class Gatekeeper:
 
     def is_split(self, serial: str) -> bool:
         return os.path.exists(self._split_marker(serial))
+
+    def settle_split(self, reset_bdfs) -> tuple[list[str], list[str]]:
+        """After a reset that ran, update each touched board's split mark.
+
+        Decided per board, by what was actually reset: every die of a board
+        reset together brings its die-to-die link back (clear the mark); some
+        but not all of its dies reset takes it down (set the mark). Boards of
+        one chip have no such link and are never marked. Grain does not
+        enter into it, so a board-grain release, a whole-board chip-grain
+        lease and reset-all all heal a mark left earlier.
+        Returns (cleared serials, marked serials)."""
+        reset = set(reset_bdfs)
+        cleared, marked = [], []
+        for board in self.boards:
+            bdfs = {c.bdf for c in board.chips}
+            if len(bdfs) < 2 or not bdfs & reset:
+                continue
+            if bdfs <= reset:
+                self.clear_split(board.serial)
+                cleared.append(board.serial)
+            else:
+                self.mark_split(board.serial)
+                marked.append(board.serial)
+        return cleared, marked
 
     def unit_key_for(self, chip: Chip, grain: str | None = None) -> str:
         """Board serial at board grain, BDF at chip grain."""

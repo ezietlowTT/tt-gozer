@@ -474,14 +474,13 @@ class Keymaster:
 
         # First revalidation: are these units still ours, right now, with
         # nobody able to claim them while we look?
-        board_wide: list[str] = []      # partner units locked for this reset
-        split_boards: set[str] = set()  # boards whose partner die was busy
+        board_wide: list[str] = []      # partner units borrowed for this reset
         with self.gk.critical_section():
             foreign = self._units_held_elsewhere(units, lease_id)
             unheld = [u for u in units
                       if self.gk.unit_lease(u) is None]
             if not foreign and not unheld and derived_bdfs and not no_reset:
-                board_wide, split_boards = self._lock_free_partners(units, lease)
+                board_wide = self._lock_free_partners(units, lease)
         if foreign:
             history.log(self.gk.history_root, "refused", action="release",
                        lease_id=lease_id, who=lease.get("who"),
@@ -496,6 +495,31 @@ class Keymaster:
 
         reset_ran = False
         reset_ok = False
+        partner_bdfs = [c.bdf for u in board_wide
+                        for c in self.gk.chips_in_unit(u)]
+        reset_bdfs = derived_bdfs + partner_bdfs
+        try:
+            return self._release_after_lock(
+                lease, lease_id, units, derived_bdfs, reset_bdfs,
+                board_wide, unheld, no_reset, messages)
+        finally:
+            # Whatever happened -- including an interrupt during the reset --
+            # a borrowed partner must not stay locked. Normally
+            # _release_after_lock has already settled it and this is a no-op
+            # (release_unit only drops a lock still carrying our id).
+            if board_wide:
+                with self.gk.critical_section():
+                    for unit in board_wide:
+                        self.gk.release_unit(unit, expected_lease_id=lease_id)
+
+    def _release_after_lock(self, lease, lease_id, units, derived_bdfs,
+                            reset_bdfs, board_wide, unheld, no_reset,
+                            messages) -> ReleaseResult:
+        """release_result from the reset onward (split out so the borrowed
+        partner units can be settled in a finally around it)."""
+        reset_ran = False
+        reset_ok = False
+        partner_bdfs = [b for b in reset_bdfs if b not in derived_bdfs]
         if not derived_bdfs and not no_reset:
             messages.append(
                 f"not resetting: lease {lease_id} has no chips "
@@ -509,20 +533,19 @@ class Keymaster:
                 f"by lease {lease_id} (already reaped?)")
         elif not no_reset:
             reset_ran = True
-            partner_bdfs = [c.bdf for u in board_wide
-                            for c in self.gk.chips_in_unit(u)]
+            partial = self._partial_boards(reset_bdfs)
             if partner_bdfs:
                 messages.append(
                     "board partner free: resetting the whole board "
                     f"({', '.join(partner_bdfs)} too) so its on-board link "
                     "comes back up")
-            elif split_boards:
+            if partial:
                 messages.append(
                     "board partner in use: resetting only this die; "
-                    f"board {', '.join(sorted(split_boards))} needs a "
+                    f"board {', '.join(partial)} needs a "
                     "whole-board reset before a mesh over both dies")
             try:
-                reset_ok, out = reset_mod.reset_chips(derived_bdfs + partner_bdfs,
+                reset_ok, out = reset_mod.reset_chips(reset_bdfs,
                                                       runner=self.reset_runner)
             except reset_mod.ResetError as e:
                 # A chip id that is not a PCI address. Count it as a failed
@@ -537,19 +560,17 @@ class Keymaster:
         with self.gk.critical_section():
             # The partner units were only borrowed for the reset: settle them
             # first, whatever happens to our own units below.
-            if board_wide:
-                for unit in board_wide:
-                    if reset_ok:
-                        self.gk.mark_clean(unit)
-                    self.gk.release_unit(unit, expected_lease_id=lease_id)
-                if reset_ok:
-                    for unit in units:
-                        board = self.gk.board_of(unit)
-                        if board is not None:
-                            self.gk.clear_split(board.serial)
-            if reset_ran and split_boards:
-                for serial in split_boards:
-                    self.gk.mark_split(serial)
+            for unit in board_wide:
+                # Clean only if the lock is still ours: a unit that was
+                # reaped and granted on mid-reset belongs to its new tenant.
+                still_ours = ((self.gk.unit_lease(unit) or {}).get("lease_id")
+                              == lease_id)
+                if reset_ok and still_ours:
+                    self.gk.mark_clean(unit)
+                self.gk.release_unit(unit, expected_lease_id=lease_id)
+            split_marked: list[str] = []
+            if reset_ran and reset_ok:
+                _, split_marked = self.gk.settle_split(reset_bdfs)
             foreign = self._units_held_elsewhere(units, lease_id)
             if foreign:
                 history.log(self.gk.history_root, "refused", action="release",
@@ -593,8 +614,7 @@ class Keymaster:
                    duration_s=duration_s, reset_ran=reset_ran,
                    reset_ok=reset_ok if reset_ran else None,
                    **({"board_reset": sorted(board_wide)} if board_wide else {}),
-                   **({"split": sorted(split_boards)}
-                      if reset_ran and split_boards else {}))
+                   **({"split": sorted(split_marked)} if split_marked else {}))
         # A reset that failed, or was skipped because the units gave no chips,
         # leaves the lease torn down and the silicon unreset. That is not a
         # clean release, whatever the exit used to say: the units are not
@@ -610,37 +630,66 @@ class Keymaster:
         return ReleaseResult(True, "released",
                              "; ".join(m for m in messages if m))
 
-    def _lock_free_partners(self, units: list[str],
-                            lease: dict) -> tuple[list[str], set[str]]:
-        """At chip grain, lock the board partners of `units` for a
-        whole-board reset when every one of them is free (no lease, no open
-        device). Call under critical_section.
+    def _partial_boards(self, reset_bdfs) -> list[str]:
+        """Boards of two or more dies of which only some are in reset_bdfs."""
+        reset = set(reset_bdfs)
+        return sorted(b.serial for b in self.gk.boards
+                      if len(b.chips) > 1
+                      and {c.bdf for c in b.chips} & reset
+                      and not {c.bdf for c in b.chips} <= reset)
 
-        Returns (partner units locked under this lease's id, serials of
-        boards whose partners were busy). A die reset on its own leaves the
-        board's die-to-die link down, so the whole board is reset whenever
-        nobody is on the partner; when somebody is, only our die is reset and
-        the board is marked split (see Gatekeeper.partner_units)."""
+    def _lock_free_partners(self, units: list[str], lease: dict) -> list[str]:
+        """At chip grain, borrow the free board partners of `units` so the
+        whole board can be reset. Call under critical_section.
+
+        Decided per board: a board's partner dies are borrowed only if every
+        one of them has no lease (or one left by an interrupted release of
+        this same lease) and no open device. A board whose partner is busy
+        gets only our die reset, and settle_split marks it afterwards.
+
+        The borrowed lock carries our lease_id (so release_unit's guard
+        applies) but is owned by this process, not by the lease's original
+        owner: a detached lease past its grace window, or an owner that has
+        exited, would otherwise make the borrowed lock STALE the moment it
+        was written, and a concurrent acquire could reap it and grant the die
+        while it is being reset."""
         partners = self.gk.partner_units(units)
         if not partners:
-            return [], set()
-        boards = {b.serial for u in units if (b := self.gk.board_of(u))}
+            return []
+        lid = lease.get("lease_id")
+        me = os.getpid()
+        borrowed = {**lease, "pid": me, "pgid": _pgid(me), "detached": False,
+                    "since": utcnow(), "renewed_at": None,
+                    "borrowed_for_reset": lid}
         fd_map = procfd.holders(self.gk.proc_root)
-        free = all(
-            self.gk.unit_lease(p) is None
-            and not any(fd_map.get(c.dev_index) for c in self.gk.chips_in_unit(p))
-            for p in partners)
-        if not free:
-            return [], boards
-        locked: list[str] = []
+        by_board: dict[str, list[str]] = {}
         for p in partners:
-            if self.gk.claim_unit(p, lease):
-                locked.append(p)
+            board = self.gk.board_of(p)
+            if board is not None:
+                by_board.setdefault(board.serial, []).append(p)
+        locked: list[str] = []
+        for serial, members in by_board.items():
+            def ours_or_free(unit):
+                cur = self.gk.unit_lease(unit)
+                return cur is None or cur.get("lease_id") == lid
+            if not all(ours_or_free(p)
+                       and not any(fd_map.get(c.dev_index)
+                                   for c in self.gk.chips_in_unit(p))
+                       for p in members):
                 continue
-            for done in locked:
-                self.gk.release_unit(done, expected_lease_id=lease.get("lease_id"))
-            return [], boards
-        return locked, set()
+            got: list[str] = []
+            for p in members:
+                cur = self.gk.unit_lease(p)
+                if (cur is not None and cur.get("lease_id") == lid) or \
+                        self.gk.claim_unit(p, borrowed):
+                    got.append(p)
+                    continue
+                for done in got:
+                    self.gk.release_unit(done, expected_lease_id=lid)
+                got = []
+                break
+            locked.extend(got)
+        return locked
 
     def _missing_lease(self, lease_id: str) -> ReleaseResult:
         """"not found", plus what history says happened to the lease: reaped
@@ -741,6 +790,9 @@ class Keymaster:
                     chips = self.gk.chips_in_unit(unit)
                     if chips and not any(self.gk.short_board_of(c) for c in chips):
                         self.gk.mark_clean(unit)
+                # Every die was reset together, so every on-board link is back.
+                self.gk.settle_split(
+                    [c.bdf for u in grant.units for c in self.gk.chips_in_unit(u)])
 
         released = self.release_result(grant.lease_id, no_reset=True)
 
@@ -880,17 +932,11 @@ class Keymaster:
             unheld = [u for u in units if self.gk.unit_lease(u) is None]
             # A reset that covered a whole board brings its on-board link back;
             # one die of a shared board on its own takes it down.
-            partners = set(self.gk.partner_units(units))
-            for serial in {b.serial for u in units if (b := self.gk.board_of(u))}:
-                board_units = {self.gk.unit_key_for(c)
-                               for b in self.gk.boards if b.serial == serial
-                               for c in b.chips}
-                if board_units & partners:
-                    self.gk.mark_split(serial)
+            if reset_ok:
+                _, marked = self.gk.settle_split(chips)
+                for serial in marked:
                     message += (f"; board {serial} needs a whole-board reset "
                                 "before a mesh over both dies")
-                elif reset_ok:
-                    self.gk.clear_split(serial)
         history.log(self.gk.history_root, "reset", lease_id=lease_id,
                    who=lease.get("who"), chips=chips, reset_ok=reset_ok)
         if foreign:
