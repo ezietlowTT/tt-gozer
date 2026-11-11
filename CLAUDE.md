@@ -803,7 +803,9 @@ the ownership check, no finally) each red.
 
 Not done: the "partner's next open failed" case is handled only by the split mark and the next
 whole-board reset; gozer does not reset a die on grant. `eth_neighbours` warnings are unchanged.
-Two sibling dies released at the same moment each see the other leased, so both reset one die
-and the board stays split until its next whole-board reset (release of a single die later, a
-both-dies lease, a board-grain lease or reset-all all heal it). Concurrent single-die resets on
-one board are untested on hardware.
+Two sibling dies released at the same moment each see the other leased, so both reset one die.
+This happened on hardware when four MOSS-Image servers (one per die) were stopped together: board
+2 ended split, and the two single-die resets ran concurrently on one board without error. Fixed by
+`_heal_split_boards`: a release that leaves a board split and then finds every die of it free (no
+lease, no open device) borrows them all and resets the board whole (`board_heal` in history), so
+the release that finishes last heals it, at the cost of one more reset.

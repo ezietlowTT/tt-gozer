@@ -621,6 +621,10 @@ class Keymaster:
         # marked clean, so --fresh refuses them, and the caller is told how to
         # put them through a reset.
         needs_reset = reset_ran and not reset_ok
+        if split_marked and not needs_reset:
+            for serial in self._heal_split_boards(split_marked, lease):
+                messages.append(f"board {serial}: every die is free now, so it was "
+                                "reset whole and is no longer split")
         if needs_reset:
             recovery = self._recovery_commands(units, lease_id)
             messages.append("recover with: " + recovery)
@@ -629,6 +633,63 @@ class Keymaster:
                                  units=list(units), recovery=recovery)
         return ReleaseResult(True, "released",
                              "; ".join(m for m in messages if m))
+
+    def _heal_split_boards(self, serials: list[str], lease: dict) -> list[str]:
+        """Reset whole any of these split boards whose dies are all free now.
+
+        Two sibling dies released at the same moment each see the other still
+        leased, so each resets only its own die and the board ends split with
+        nobody left to heal it. The release that finishes last finds every die
+        free and does one more, whole-board reset. Returns the serials healed;
+        a board with any lease or open device is left as it is."""
+        lid = lease.get("lease_id")
+        me = os.getpid()
+        borrowed = {**lease, "pid": me, "pgid": _pgid(me), "detached": False,
+                    "since": utcnow(), "renewed_at": None,
+                    "borrowed_for_reset": lid}
+        healed = []
+        for serial in serials:
+            board = next((b for b in self.gk.boards if b.serial == serial), None)
+            if board is None or len(board.chips) < 2:
+                continue
+            unit_keys = []
+            for c in board.chips:
+                key = self.gk.unit_key_for(c)
+                if key not in unit_keys:
+                    unit_keys.append(key)
+            locked: list[str] = []
+            try:
+                with self.gk.critical_section():
+                    fd_map = procfd.holders(self.gk.proc_root)
+                    if any(self.gk.unit_lease(u) is not None for u in unit_keys) or \
+                            any(fd_map.get(c.dev_index) for c in board.chips):
+                        continue
+                    for u in unit_keys:
+                        if not self.gk.claim_unit(u, borrowed):
+                            break
+                        locked.append(u)
+                    if len(locked) != len(unit_keys):
+                        continue
+                bdfs = [c.bdf for c in board.chips]
+                try:
+                    ok, _ = reset_mod.reset_chips(bdfs, runner=self.reset_runner)
+                except reset_mod.ResetError:
+                    ok = False
+                with self.gk.critical_section():
+                    if ok:
+                        for u in unit_keys:
+                            if (self.gk.unit_lease(u) or {}).get("lease_id") == lid:
+                                self.gk.mark_clean(u)
+                        self.gk.settle_split(bdfs)
+                        healed.append(serial)
+                history.log(self.gk.history_root, "board_heal", lease_id=lid,
+                           board=serial, chips=bdfs, reset_ok=ok)
+            finally:
+                if locked:
+                    with self.gk.critical_section():
+                        for u in locked:
+                            self.gk.release_unit(u, expected_lease_id=lid)
+        return healed
 
     def _partial_boards(self, reset_bdfs) -> list[str]:
         """Boards of two or more dies of which only some are in reset_bdfs."""

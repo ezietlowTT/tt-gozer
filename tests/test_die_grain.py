@@ -340,3 +340,41 @@ def test_a_partner_left_locked_under_our_own_id_is_ours_to_reset(tmp_path, sysfs
     km.release(a.lease_id)
     assert sorted(resets[-1]) == [A0, A1]
     assert gk.held_units() == {} and not gk.is_split(BOARD_A)
+
+
+def test_simultaneous_sibling_releases_heal_the_board(tmp_path, sysfs):
+    """Seen on hardware: two dies of one board released at the same moment
+    each saw the other leased, so the board was left split. The release that
+    finishes last now resets it whole."""
+    km, gk, resets = make(tmp_path, sysfs)
+    a = km.acquire("1", who="a", pid=1, exact=A0)
+    b = km.acquire("1", who="b", pid=1, exact=A1)
+    km2 = Keymaster(Gatekeeper(root=gk.root, sysfs_root=gk.sysfs_root,
+                               proc_root=gk.proc_root))
+    order = []
+
+    def runner_a(argv, **kw):
+        order.append(("a", argv[2].split(",")))
+        if len(order) == 1:
+            # B releases while A's reset is still running: A is leased.
+            assert km2.release(b.lease_id)[0]
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def runner_b(argv, **kw):
+        order.append(("b", argv[2].split(",")))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    km.reset_runner, km2.reset_runner = runner_a, runner_b
+    assert km.release(a.lease_id)[0]
+    assert order[0] == ("a", [A0]) and order[1] == ("b", [A1])   # both single-die
+    assert sorted(order[-1][1]) == [A0, A1]                      # then one heal
+    assert not gk.is_split(BOARD_A)
+    assert gk.held_units() == {}
+    assert gk.is_clean(A0) and gk.is_clean(A1)
+
+
+def test_no_heal_while_the_partner_is_in_use(tmp_path, sysfs):
+    km, gk, resets = make(tmp_path, sysfs)
+    a = km.acquire("1", who="a", pid=1, exact=A0)
+    km.acquire("1", who="b", pid=1, exact=A1)
+    km.release(a.lease_id)
+    assert resets == [[A0]] and gk.is_split(BOARD_A)
