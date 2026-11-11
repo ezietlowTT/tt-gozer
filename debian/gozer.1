@@ -22,8 +22,8 @@ Show the chips, the boards they sit on, and the lease grain.
 .B grain [auto|board|chip] [--json]
 Show the lease unit, or set it for the box. Board grain is the default on boards of two dies (p300c); chip grain leases single dies, and a release then resets the whole board when the other die is free, or marks the board split. Refused while anything is leased or queued.
 .TP
-.B services [--check] [--json]
-List leases that serve something (--service), with their model, port, chips and state, for a router. Read\-only. --check asks each one for GET /v1/models.
+.B services [--check] [--live] [--json]
+List leases that serve something (--service), with their model, port, chips and state, for a router. Read\-only. --live leaves out leases whose owner is gone (what a router should use); --check asks each one for GET /v1/models on 127.0.0.1. A service name or port already used by another lease is refused.
 .TP
 .B acquire|summon --chips N|all|LO\-HI --who WHO [--reason R] [--exact X] [--fresh] [--expect D] [--ticket T] [--no\-queue] [--owner\-pid PID] [--service NAME [--port P] [--model ID]]
 Take a lease on N chips, or queue a ticket if none are free (exit 10). The lease is judged by open file descriptors: a standalone lease has a 900 second grace window, and --owner\-pid makes a supervisor's pid own it instead. --fresh requires chips a real reset marked clean. --no\-queue exits at once when no chips are free, without taking a ticket. --service, --port and --model record what the lease serves, for gozer services.

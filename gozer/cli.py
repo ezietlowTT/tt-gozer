@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json as jsonlib
+import urllib.parse as urllib_parse
 import os
 import sys
 import time
@@ -188,7 +189,10 @@ def _queue_line(gk, i: int, e: dict) -> str:
     return line
 
 
-SERVICE_NAME_RE = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+# No "/": a router reaches a service as /svc/<name>/<path>. fullmatch, so a
+# trailing newline is not accepted the way "$" would.
+SERVICE_NAME_RE = __import__("re").compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+LIVE_STATES = ("HELD", "CLAIMED")
 
 
 def _add_service_args(parser) -> None:
@@ -202,22 +206,52 @@ def _add_service_args(parser) -> None:
                         "/v1/models (with --service; default: the service name)")
 
 
-def _service_from_args(args) -> tuple[dict | None, str | None]:
-    """(service record, None) or (None, error). No --service, no record."""
+def _service_from_args(args, current: dict | None = None
+                       ) -> tuple[dict | None, str | None]:
+    """(service record, None) or (None, error). No --service, no record.
+
+    `current` is the lease's existing record (renew): given fields replace
+    its fields, the rest are kept, so `renew L --port 9001` moves only the
+    port."""
     name = getattr(args, "service", None)
     port = getattr(args, "port", None)
     model = getattr(args, "model", None)
+    if current and name is None and (port is not None or model is not None):
+        name = current.get("name")
     if name is None:
         if port is not None or model is not None:
             return None, "--port and --model describe a --service; name it"
         return None, None
-    if not SERVICE_NAME_RE.match(name):
-        return None, f"--service {name!r}: use letters, digits and . _ : / -"
+    if not SERVICE_NAME_RE.fullmatch(name):
+        return None, f"--service {name!r}: use letters, digits and . _ : -"
     if port is not None and not 1 <= port <= 65535:
         return None, f"--port {port}: not a TCP port"
     if model is not None and not model.strip():
         return None, "--model must not be empty"
+    if current and current.get("name") == name:
+        port = port if port is not None else current.get("port")
+        model = model or current.get("model")
     return {"name": name, "port": port, "model": model or name}, None
+
+
+def _service_clash(gk, service: dict | None, lease_id: str | None = None) -> str | None:
+    """Another live lease already serving this name or port? Two leases
+    behind one name or port would send a router's requests to whichever it
+    found first."""
+    if not service:
+        return None
+    for lease in gk.held_units().values():
+        other = lease.get("service")
+        if not other or lease.get("borrowed_for_reset") or \
+                lease.get("lease_id") == lease_id:
+            continue
+        if other.get("name") == service["name"]:
+            return (f"service {service['name']!r} is already served by lease "
+                    f"{lease.get('lease_id')} ({lease.get('who')})")
+        if service.get("port") and other.get("port") == service["port"]:
+            return (f"port {service['port']} is already used by service "
+                    f"{other.get('name')!r} (lease {lease.get('lease_id')})")
+    return None
 
 
 def cmd_services(args) -> int:
@@ -229,7 +263,7 @@ def cmd_services(args) -> int:
     states = gk.reconcile(reap=False)
     state_of = {}
     for st in states:
-        if st.lease:
+        if st.lease and not st.lease.get("borrowed_for_reset"):
             state_of.setdefault(st.lease.get("lease_id"), st.state)
     seen, out = set(), []
     for lease in gk.held_units().values():
@@ -238,13 +272,20 @@ def cmd_services(args) -> int:
         if not svc or lid in seen or lease.get("borrowed_for_reset"):
             continue
         seen.add(lid)
-        entry = {"service": svc.get("name"), "model": svc.get("model"),
+        entry = {"service": svc.get("name") or "?",
+                 "model": svc.get("model") or svc.get("name") or "?",
                  "port": svc.get("port"),
                  "url": (f"http://127.0.0.1:{svc['port']}"
                          if svc.get("port") else None),
                  "lease_id": lid, "who": lease.get("who"),
                  "chips": lease.get("chips", []),
                  "state": state_of.get(lid)}
+        # `live`: the lease's owner is alive (HELD or CLAIMED). A STALE lease
+        # (owner gone, not yet reaped) is listed for humans but must not be
+        # routed to.
+        entry["live"] = entry["state"] in LIVE_STATES
+        if args.live and not entry["live"]:
+            continue
         if args.check and entry["url"]:
             entry["up"] = _probe(entry["url"] + "/v1/models")
         out.append(entry)
@@ -261,10 +302,17 @@ def cmd_services(args) -> int:
 
 
 def _probe(url: str) -> bool:
-    import urllib.request
+    """GET on localhost, directly: no $http_proxy, no redirects followed. Any
+    HTTP answer below 500 counts as up (a server behind an API key answers
+    401 and is still up)."""
+    import http.client
+    parts = urllib_parse.urlsplit(url)
     try:
-        with urllib.request.urlopen(url, timeout=1) as r:   # noqa: S310 - localhost
-            return 200 <= r.status < 300
+        conn = http.client.HTTPConnection("127.0.0.1", parts.port, timeout=1)
+        conn.request("GET", parts.path or "/")
+        status = conn.getresponse().status
+        conn.close()
+        return status < 500
     except Exception:  # noqa: BLE001
         return False
 
@@ -496,6 +544,7 @@ def cmd_acquire(args) -> int:
     if refused is not None:
         return refused
     service, bad = _service_from_args(args)
+    bad = bad or _service_clash(gk, service)
     if bad:
         _emit({"granted": False, "error": bad}, f"gozer: {bad}", args.json)
         return EXIT_UNAVAILABLE
@@ -671,7 +720,8 @@ def cmd_renew(args) -> int:
         return EXIT_NO_LEASE
     from gozer.gatekeeper import utcnow
     from gozer.keymaster import _deadline
-    service, bad = _service_from_args(args)
+    service, bad = _service_from_args(args, current=lease.get("service"))
+    bad = bad or _service_clash(gk, service, lease_id=args.lease)
     if bad:
         _emit({"renewed": False, "error": bad}, f"gozer: {bad}", args.json)
         return EXIT_UNAVAILABLE
@@ -794,6 +844,7 @@ def cmd_adopt(args) -> int:
               args.json)
         return EXIT_UNAVAILABLE
     service, bad = _service_from_args(args)
+    bad = bad or _service_clash(gk, service)
     if bad:
         _emit({"adopted": False, "error": bad}, f"gozer: {bad}", args.json)
         return EXIT_UNAVAILABLE
@@ -1034,6 +1085,7 @@ def cmd_run(args) -> int:
         print("nothing to run: put the command after --", file=sys.stderr)
         return EXIT_UNAVAILABLE
     service, bad = _service_from_args(args)
+    bad = bad or _service_clash(gk, service)
     if bad:
         print(f"gozer: {bad}", file=sys.stderr)
         return EXIT_UNAVAILABLE
@@ -1128,6 +1180,8 @@ def build_parser() -> argparse.ArgumentParser:
              "what is being served, where, on which chips (for a router)")
     sv.add_argument("--check", action="store_true",
                     help="ask each service for GET /v1/models (1 s timeout)")
+    sv.add_argument("--live", action="store_true",
+                    help="only leases whose owner is alive (what a router should use)")
 
     r = add("renew", cmd_renew, "heartbeat a lease (restarts a detached lease's grace window); --expect also extends its advisory deadline")
     r.add_argument("lease")
